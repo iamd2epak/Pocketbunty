@@ -4,9 +4,10 @@
 # Installs everything the app needs (Python + bridge server, jcode, git, GitHub CLI),
 # starts the bridge and links the app. Safe to run again: finished steps are skipped,
 # and it repairs what is missing or broken. Everything lives in one hidden folder, ~/.pocketbunty
-# (bridge, token, start script, this script, logs), so it isn't deleted by mistake.
+# (bridge, token, start script, logs), so it isn't deleted by mistake. It also adds the
+# `pocketbunty` command: reconnects the app (or repairs the setup if files are missing).
 #
-#   mkdir -p ~/.pocketbunty && curl -fsSL https://raw.githubusercontent.com/iamd2epak/pocketbunty/main/scripts/setup.sh -o ~/.pocketbunty/setup.sh && bash ~/.pocketbunty/setup.sh
+#   bash <(curl -fsSL https://raw.githubusercontent.com/iamd2epak/pocketbunty/main/scripts/setup.sh)
 #
 # Options: --update-jcode (reinstall jcode), --no-jcode (skip jcode), --no-start (don't start the bridge)
 
@@ -219,6 +220,25 @@ echo $! >"$PID_FILE"
 EOF2
 chmod +x "$START" && ok "start script: ~/.pocketbunty/start.sh"
 
+# `pocketbunty` command: one short word to reconnect the app later.
+CMD="$PREFIX/bin/pocketbunty"
+cat >"$CMD" <<'EOF2'
+#!/data/data/com.termux/files/usr/bin/bash
+# PocketBunty: starts the bridge and goes back to the app. "pocketbunty setup" repairs everything.
+DIR="$HOME/.pocketbunty"
+URL="https://raw.githubusercontent.com/iamd2epak/pocketbunty/main/scripts/setup.sh"
+if [ "${1:-}" != setup ] && [ -f "$DIR/server.py" ] && [ -s "$DIR/token" ] && [ -x "$DIR/start.sh" ]; then
+  "$DIR/start.sh"; sleep 1
+  echo "PocketBunty: connected, going back to the app…"
+  am start -a android.intent.action.VIEW -d "termichat://link?token=$(head -n1 "$DIR/token" | tr -d '[:space:]')" >/dev/null 2>&1
+else
+  [ "${1:-}" = setup ] && shift
+  echo "PocketBunty: setting up…"
+  mkdir -p "$DIR" && curl -fsSL "$URL" -o "$DIR/setup.sh" && exec bash "$DIR/setup.sh" "$@"
+fi
+EOF2
+chmod +x "$CMD" && ok "command added: pocketbunty (reconnects the app)"
+
 # Every Termux login shell: start the bridge if needed, and find jcode in ~/.local/bin.
 PROFILE_D="$PREFIX/etc/profile.d"
 mkdir -p "$PROFILE_D"
@@ -276,7 +296,7 @@ health() { curl -fsS --max-time 3 -H "X-Token: $TOKEN" "http://127.0.0.1:$PORT/h
 if [ "$WANT_START" = true ]; then
   step "Starting the bridge"
   if inside_bridge; then
-    warn "running inside the app's terminal: restart the bridge later from Termux (bash ~/.pocketbunty/start.sh)"
+    warn "running inside the app's terminal: restart the bridge later from Termux (type: pocketbunty)"
   else
     # Restart so the new server.py runs.
     # Also stops an old bridge still running from ~/bridge.
@@ -318,7 +338,7 @@ rm -f "$HOME/pocketbunty-setup.sh" "$HOME/.pocketbunty-setup.log" 2>/dev/null
 # ---------- summary ----------
 printf '\n'
 if [ ${#PROBLEMS[@]} -eq 0 ]; then
-  printf '%s✓ All set!%s Go back to the app. Next time just open Termux: the bridge starts by itself.\n' "$C_OK" "$C_OFF"
+  printf '%s✓ All set!%s Go back to the app. Next time just open Termux (or type: pocketbunty).\n' "$C_OK" "$C_OFF"
 else
   printf '%sSetup finished with %d problem(s):%s\n' "$C_WARN" "${#PROBLEMS[@]}" "$C_OFF"
   for p in "${PROBLEMS[@]}"; do printf '  - %s\n' "$p"; done

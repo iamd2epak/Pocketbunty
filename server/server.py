@@ -33,7 +33,7 @@ import termios
 
 from aiohttp import WSMsgType, web
 
-VERSION = 7  # 7: lives in the hidden ~/.pocketbunty folder
+VERSION = 8  # 7: hidden ~/.pocketbunty folder; 8: `pocketbunty` reconnect command
 HOST = "127.0.0.1"  # never 0.0.0.0
 PORT = 8765
 BRIDGE_DIR = os.path.expanduser("~/.pocketbunty")
