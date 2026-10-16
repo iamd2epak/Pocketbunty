@@ -1,21 +1,21 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # PocketBunty one-time setup for Termux.
 #
-# Installs everything the app needs (Python + bridge server, jcode, git, GitHub CLI),
-# starts the bridge and links the app. Safe to run again: finished steps are skipped,
+# Sets up only the bridge (Termux packages, Python + bridge server), starts it and links the app.
+# The app then installs the rest (git, GitHub CLI, jcode) in the background with scripts/env.sh. Safe to run again: finished steps are skipped,
 # and it repairs what is missing or broken. Everything lives in one hidden folder, ~/.pocketbunty
 # (bridge, token, start script, logs), so it isn't deleted by mistake. It also adds the
 # `pocketbunty` command: reconnects the app (or repairs the setup if files are missing).
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/iamd2epak/pocketbunty/main/scripts/setup.sh)
 #
-# Options: --update-jcode (reinstall jcode), --no-jcode (skip jcode), --no-start (don't start the bridge)
+# Options: --full (also install git, gh and jcode here), --update-jcode (same, reinstalling jcode),
+#          --no-start (don't start the bridge)
 
 set -u
 set -o pipefail
 
 BASE_URL="${POCKETBUNTY_BASE_URL:-https://raw.githubusercontent.com/iamd2epak/pocketbunty/main}"
-JCODE_INSTALL_URL="https://jcode.sh/install"
 BRIDGE_DIR="$HOME/.pocketbunty"
 OLD_DIR="$HOME/bridge"  # before v7 the bridge lived here (visible): moved into BRIDGE_DIR
 SERVER="$BRIDGE_DIR/server.py"
@@ -24,14 +24,16 @@ LOG="$BRIDGE_DIR/setup.log"
 PORT=8765
 APP_LINK="termichat://link"
 
-UPDATE_JCODE=false
-WANT_JCODE=true
+ENV_ARGS=()
+WANT_ENV=false
 WANT_START=true
 for arg in "$@"; do
   case "$arg" in
-    --update-jcode) UPDATE_JCODE=true ;;
-    --no-jcode) WANT_JCODE=false ;;
-    --no-start) WANT_START=false ;;
+    --full) WANT_ENV=true ;;
+    --update-jcode) WANT_ENV=true; ENV_ARGS+=(--update-jcode) ;;
+    # Older apps ran "--no-start" in their terminal to install jcode: keep doing that.
+    --no-start) WANT_START=false; WANT_ENV=true ;;
+    --no-jcode) WANT_ENV=false ;;
   esac
 done
 
@@ -89,12 +91,6 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'rm -rf "$LOCK"' EXIT
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-  aarch64|arm64|x86_64) JCODE_ARCH_OK=true ;;
-  *) JCODE_ARCH_OK=false ;;
-esac
-
 if [ "${TERMUX_APK_RELEASE:-}" = "GOOGLE_PLAY_STORE" ]; then
   warn "Termux from Google Play has limits. If something fails, install Termux from F-Droid or GitHub."
 fi
@@ -148,11 +144,7 @@ step "Installing tools"
 pkg_need python python || die "couldn't install Python. See $LOG"
 pkg_need python-pip pip || problem "pip couldn't be installed (needed for the bridge)"
 pkg_need curl curl || die "couldn't install curl. See $LOG"
-pkg_need coreutils sha256sum || problem "coreutils couldn't be installed"
-pkg_need tar tar || problem "tar couldn't be installed"
 pkg_need procps pgrep || warn "procps not installed (bridge auto-start check is weaker)"
-pkg_need git git || problem "git couldn't be installed (needed for GitHub projects)"
-pkg_need gh gh || problem "GitHub CLI (gh) couldn't be installed (needed for GitHub login)"
 pkg_need termux-am am || warn "termux-am not installed (the app may need the token pasted by hand)"
 
 # ---------- 2. Python packages for the bridge ----------
@@ -188,6 +180,16 @@ else
   else die "couldn't download server.py. Check your internet connection."; fi
 fi
 rm -rf "$BRIDGE_DIR/__pycache__" 2>/dev/null
+
+# env.sh: the app runs it next (in the background) for git, GitHub CLI and jcode.
+ENV_SH="$BRIDGE_DIR/env.sh"
+if run_retry 3 curl -fsSL --connect-timeout 15 -o "$ENV_SH.download" "$BASE_URL/scripts/env.sh" \
+   && grep -q "pocketbunty-env" "$ENV_SH.download" && bash -n "$ENV_SH.download" 2>>"$LOG"; then
+  mv -f "$ENV_SH.download" "$ENV_SH" && ok "env.sh downloaded"
+else
+  rm -f "$ENV_SH.download"
+  warn "couldn't download env.sh now (the app downloads it later)"
+fi
 
 # Token: same file server.py reads, created here so the app can be linked right away.
 TOKEN_FILE="$BRIDGE_DIR/token"
@@ -250,46 +252,6 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$P
 EOF2
 ok "bridge starts by itself when you open Termux"
 
-# ---------- 3. jcode ----------
-JCODE_BIN="$HOME/.local/bin/jcode"
-jcode_works() { [ -x "$JCODE_BIN" ] && "$JCODE_BIN" --version >/dev/null 2>&1; }
-jcode_version() { "$JCODE_BIN" --version 2>/dev/null | head -n1; }
-
-if [ "$WANT_JCODE" = true ]; then
-  step "Installing jcode (AI coding agent)"
-  if [ "$JCODE_ARCH_OK" != true ]; then
-    problem "jcode doesn't support this phone's CPU ($ARCH). The terminal and files still work."
-  elif jcode_works && [ "$UPDATE_JCODE" != true ]; then
-    ok "$(jcode_version)"
-  else
-    # jcode is a glibc program: Termux needs glibc + patchelf to run it.
-    if [ ! -d "$PREFIX/glibc/lib" ]; then
-      pkg_need glibc-repo - || problem "glibc-repo couldn't be installed"
-      run_retry 2 apt_update
-      pkg_need glibc - || problem "glibc couldn't be installed (jcode needs it)"
-    else
-      ok "glibc"
-    fi
-    pkg_need patchelf patchelf || problem "patchelf couldn't be installed (jcode needs it)"
-    jcode_install() { curl -fsSL --connect-timeout 15 "$JCODE_INSTALL_URL" | bash; }
-    if run_retry 3 jcode_install && jcode_works; then
-      ok "$(jcode_version) installed"
-    else
-      problem "jcode didn't install. Run this command again later (see $LOG)"
-    fi
-  fi
-fi
-
-# ---------- 4. git defaults ----------
-step "Git"
-if have git; then
-  git config --global init.defaultBranch >/dev/null 2>&1 || git config --global init.defaultBranch main
-  git config --global --get safe.directory >/dev/null 2>&1 || git config --global --add safe.directory '*'
-  ok "git ready (sign in to GitHub from the app's GitHub tab)"
-else
-  warn "git missing, skipped"
-fi
-
 # ---------- 5. start and link ----------
 health() { curl -fsS --max-time 3 -H "X-Token: $TOKEN" "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }
 
@@ -325,6 +287,16 @@ if [ "$WANT_START" = true ]; then
   fi
 fi
 
+# ---------- git, GitHub CLI, jcode (only with --full / from a terminal) ----------
+if [ "$WANT_ENV" = true ]; then
+  step "Installing git, GitHub CLI and jcode"
+  if [ -f "$ENV_SH" ]; then
+    bash "$ENV_SH" "${ENV_ARGS[@]}" || problem "environment setup had problems (see $BRIDGE_DIR/env.log)"
+  else
+    problem "env.sh is missing. Run the same command again."
+  fi
+fi
+
 # ---------- clean up the old layout ----------
 # The old visible files (~/bridge, ~/pocketbunty-setup.sh) are not used any more.
 if ! inside_bridge && [ -d "$OLD_DIR" ]; then
@@ -338,7 +310,7 @@ rm -f "$HOME/pocketbunty-setup.sh" "$HOME/.pocketbunty-setup.log" 2>/dev/null
 # ---------- summary ----------
 printf '\n'
 if [ ${#PROBLEMS[@]} -eq 0 ]; then
-  printf '%s✓ All set!%s Go back to the app. Next time just open Termux (or type: pocketbunty).\n' "$C_OK" "$C_OFF"
+  printf '%s✓ Bridge ready!%s The app finishes the setup by itself. Next time just open Termux (or type: pocketbunty).\n' "$C_OK" "$C_OFF"
 else
   printf '%sSetup finished with %d problem(s):%s\n' "$C_WARN" "${#PROBLEMS[@]}" "$C_OFF"
   for p in "${PROBLEMS[@]}"; do printf '  - %s\n' "$p"; done
