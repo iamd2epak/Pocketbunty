@@ -160,6 +160,15 @@ else
     fi
     run_retry 2 apt_get install glibc || problem "glibc couldn't be installed"
   fi
+  # Libraries jcode links to (libssl/libcrypto, libgcc_s) and TLS certificates, glibc builds.
+  glibc_libs=()
+  [ -e "$PREFIX/glibc/lib/libssl.so.3" ] || glibc_libs+=(openssl-glibc)
+  [ -e "$PREFIX/glibc/lib/libgcc_s.so.1" ] || glibc_libs+=(gcc-libs-glibc)
+  dpkg -s ca-certificates-glibc >/dev/null 2>&1 || glibc_libs+=(ca-certificates-glibc)
+  if [ ${#glibc_libs[@]} -gt 0 ]; then
+    run_retry 2 apt_get install "${glibc_libs[@]}" || { run_retry 2 apt_update; run_retry 2 apt_get install "${glibc_libs[@]}"; } \
+      || problem "glibc libraries couldn't be installed (${glibc_libs[*]})"
+  fi
   install_missing patchelf:patchelf
   have patchelf || problem "patchelf couldn't be installed"
   ok "helpers installed"
@@ -190,10 +199,11 @@ jcode_own_install() {
     jfail "Not enough free storage (need 400 MB, have $((free / 1024)) MB)"; return 1
   fi
 
-  version="$(jcurl --max-time 30 "$JCODE_META/latest/version" 2>>"$LOG" | tr -d '\r\n')"
+  # GitHub first (jcode.sh's copy can lag behind), jcode.sh if GitHub is unreachable.
+  version="$(curl -fsSIL --connect-timeout 15 --max-time 30 -o /dev/null -w '%{url_effective}' "https://github.com/$JCODE_REPO/releases/latest" 2>>"$LOG")"
+  version="${version##*/}"
   if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
-    version="$(curl -fsSIL --connect-timeout 15 --max-time 30 -o /dev/null -w '%{url_effective}' "https://github.com/$JCODE_REPO/releases/latest" 2>>"$LOG")"
-    version="${version##*/}"
+    version="$(jcurl --max-time 30 "$JCODE_META/latest/version" 2>>"$LOG" | tr -d '\r\n')"
   fi
   printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+' || { jfail "Couldn't reach jcode.sh (check internet)"; return 1; }
 
@@ -244,7 +254,11 @@ jcode_own_install() {
   chmod +x "$JCODE_BIN"
   grep -qF '.local/bin' "$HOME/.bashrc" 2>/dev/null || printf '\n# Added by jcode installer\nexport PATH="%s:$PATH"\n' "$HOME/.local/bin" >>"$HOME/.bashrc"
   if ! jcode_works; then
-    "$JCODE_BIN" --version >>"$LOG" 2>&1
+    local why lib
+    why="$("$JCODE_BIN" --version 2>&1 | head -n3)"
+    echo "$why" >>"$LOG"
+    lib="$(printf '%s' "$why" | sed -n 's/.*loading shared libraries: \([^:]*\):.*/\1/p' | head -n1)"
+    [ -n "$lib" ] && { jfail "jcode needs $lib, which isn't installed"; return 1; }
     jfail "jcode was installed but doesn't start on this phone"; return 1
   fi
   rm -f "$dl"
