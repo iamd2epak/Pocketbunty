@@ -3,9 +3,10 @@
 #
 # Installs everything the app needs (Python + bridge server, jcode, git, GitHub CLI),
 # starts the bridge and links the app. Safe to run again: finished steps are skipped,
-# and it repairs what is missing or broken.
+# and it repairs what is missing or broken. Everything lives in one hidden folder, ~/.pocketbunty
+# (bridge, token, start script, this script, logs), so it isn't deleted by mistake.
 #
-#   curl -fsSL https://raw.githubusercontent.com/iamd2epak/pocketbunty/main/scripts/setup.sh -o ~/pocketbunty-setup.sh && bash ~/pocketbunty-setup.sh
+#   mkdir -p ~/.pocketbunty && curl -fsSL https://raw.githubusercontent.com/iamd2epak/pocketbunty/main/scripts/setup.sh -o ~/.pocketbunty/setup.sh && bash ~/.pocketbunty/setup.sh
 #
 # Options: --update-jcode (reinstall jcode), --no-jcode (skip jcode), --no-start (don't start the bridge)
 
@@ -14,10 +15,11 @@ set -o pipefail
 
 BASE_URL="${POCKETBUNTY_BASE_URL:-https://raw.githubusercontent.com/iamd2epak/pocketbunty/main}"
 JCODE_INSTALL_URL="https://jcode.sh/install"
-BRIDGE_DIR="$HOME/bridge"
+BRIDGE_DIR="$HOME/.pocketbunty"
+OLD_DIR="$HOME/bridge"  # before v7 the bridge lived here (visible): moved into BRIDGE_DIR
 SERVER="$BRIDGE_DIR/server.py"
 START="$BRIDGE_DIR/start.sh"
-LOG="$HOME/.pocketbunty-setup.log"
+LOG="$BRIDGE_DIR/setup.log"
 PORT=8765
 APP_LINK="termichat://link"
 
@@ -66,6 +68,7 @@ run_retry() {
 }
 
 # ---------- 0. sanity checks ----------
+mkdir -p "$BRIDGE_DIR" 2>/dev/null
 : >"$LOG" 2>/dev/null || LOG=/dev/null
 printf '%sPocketBunty setup%s  (log: %s)\n' "$C_OK" "$C_OFF" "$LOG"
 
@@ -100,7 +103,7 @@ inside_bridge() {
   local pid=$$ i=0 cmd
   while [ "$pid" -gt 1 ] && [ $i -lt 20 ]; do
     cmd="$(tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null || true)"
-    case "$cmd" in *bridge/server.py*) return 0 ;; esac
+    case "$cmd" in *bridge/server.py*|*.pocketbunty/server.py*) return 0 ;; esac
     pid="$(awk '{print $4}' /proc/$pid/stat 2>/dev/null || echo 1)"
     i=$((i + 1))
   done
@@ -187,6 +190,10 @@ rm -rf "$BRIDGE_DIR/__pycache__" 2>/dev/null
 
 # Token: same file server.py reads, created here so the app can be linked right away.
 TOKEN_FILE="$BRIDGE_DIR/token"
+# Moving from the old ~/bridge: keep its token so the app stays linked.
+if [ ! -s "$TOKEN_FILE" ] && [ -s "$OLD_DIR/token" ]; then
+  cp -f "$OLD_DIR/token" "$TOKEN_FILE" && ok "token moved from ~/bridge"
+fi
 if [ ! -s "$TOKEN_FILE" ]; then
   (umask 077; python -c 'import secrets; print(secrets.token_urlsafe(24))' >"$TOKEN_FILE") || die "can't create the token"
 fi
@@ -198,18 +205,19 @@ TOKEN="$(head -n1 "$TOKEN_FILE" | tr -d '[:space:]')"
 cat >"$START" <<'EOF2'
 #!/data/data/com.termux/files/usr/bin/bash
 # Starts the PocketBunty bridge in the background (does nothing if it already runs).
-PID_FILE="$HOME/bridge/server.pid"
+DIR="$HOME/.pocketbunty"
+PID_FILE="$DIR/server.pid"
 if [ -s "$PID_FILE" ]; then
   pid="$(cat "$PID_FILE" 2>/dev/null)"
-  case "$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null)" in *bridge/server.py*) exit 0 ;; esac
+  case "$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null)" in *.pocketbunty/server.py*) exit 0 ;; esac
 fi
-command -v pgrep >/dev/null 2>&1 && pgrep -f "bridge/server.py" >/dev/null 2>&1 && exit 0
-[ -f "$HOME/bridge/server.py" ] || exit 1
-cd "$HOME/bridge" || exit 1
-nohup python "$HOME/bridge/server.py" >"$HOME/bridge/server.log" 2>&1 </dev/null &
+command -v pgrep >/dev/null 2>&1 && pgrep -f "\.pocketbunty/server\.py" >/dev/null 2>&1 && exit 0
+[ -f "$DIR/server.py" ] || exit 1
+cd "$DIR" || exit 1
+nohup python "$DIR/server.py" >"$DIR/server.log" 2>&1 </dev/null &
 echo $! >"$PID_FILE"
 EOF2
-chmod +x "$START" && ok "start script: ~/bridge/start.sh"
+chmod +x "$START" && ok "start script: ~/.pocketbunty/start.sh"
 
 # Every Termux login shell: start the bridge if needed, and find jcode in ~/.local/bin.
 PROFILE_D="$PREFIX/etc/profile.d"
@@ -218,7 +226,7 @@ rm -f "$PROFILE_D/codenest.sh" 2>/dev/null
 cat >"$PROFILE_D/pocketbunty.sh" <<'EOF2'
 # Added by PocketBunty setup.
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
-[ -x "$HOME/bridge/start.sh" ] && "$HOME/bridge/start.sh" >/dev/null 2>&1
+[ -x "$HOME/.pocketbunty/start.sh" ] && "$HOME/.pocketbunty/start.sh" >/dev/null 2>&1
 EOF2
 ok "bridge starts by itself when you open Termux"
 
@@ -268,10 +276,11 @@ health() { curl -fsS --max-time 3 -H "X-Token: $TOKEN" "http://127.0.0.1:$PORT/h
 if [ "$WANT_START" = true ]; then
   step "Starting the bridge"
   if inside_bridge; then
-    warn "running inside the app's terminal: restart the bridge later from Termux (bash ~/bridge/start.sh)"
+    warn "running inside the app's terminal: restart the bridge later from Termux (bash ~/.pocketbunty/start.sh)"
   else
     # Restart so the new server.py runs.
-    if have pkill; then pkill -f "bridge/server.py" >/dev/null 2>&1; sleep 1; fi
+    # Also stops an old bridge still running from ~/bridge.
+    if have pkill; then pkill -f "bridge/server\.py|\.pocketbunty/server\.py" >/dev/null 2>&1; sleep 1; fi
     rm -f "$BRIDGE_DIR/server.pid"
     "$START"
   fi
@@ -283,7 +292,7 @@ if [ "$WANT_START" = true ]; then
   if [ "$started" = true ]; then
     ok "bridge is running"
   else
-    problem "bridge didn't start. Last lines of ~/bridge/server.log:"
+    problem "bridge didn't start. Last lines of ~/.pocketbunty/server.log:"
     tail -n 8 "$BRIDGE_DIR/server.log" 2>/dev/null | sed 's/^/      /'
   fi
 
@@ -295,6 +304,16 @@ if [ "$WANT_START" = true ]; then
     printf '\n      %s%s%s\n' "$C_WARN" "$TOKEN" "$C_OFF"
   fi
 fi
+
+# ---------- clean up the old layout ----------
+# The old visible files (~/bridge, ~/pocketbunty-setup.sh) are not used any more.
+if ! inside_bridge && [ -d "$OLD_DIR" ]; then
+  rm -rf "$OLD_DIR/__pycache__" 2>/dev/null
+  rm -f "$OLD_DIR/server.py" "$OLD_DIR/start.sh" "$OLD_DIR/token" "$OLD_DIR/server.log" \
+    "$OLD_DIR/server.pid" "$OLD_DIR/.server.py.download" 2>/dev/null
+  rmdir "$OLD_DIR" 2>/dev/null && ok "old ~/bridge folder removed (now in ~/.pocketbunty)"
+fi
+rm -f "$HOME/pocketbunty-setup.sh" "$HOME/.pocketbunty-setup.log" 2>/dev/null
 
 # ---------- summary ----------
 printf '\n'

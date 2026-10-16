@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PocketBunty bridge server. Runs inside Termux at ~/bridge/server.py.
+"""PocketBunty bridge server. Runs inside Termux at ~/.pocketbunty/server.py (hidden folder).
 
 Listens on 127.0.0.1:8765 only. Every request needs the X-Token header.
 
@@ -33,10 +33,10 @@ import termios
 
 from aiohttp import WSMsgType, web
 
-VERSION = 6
+VERSION = 7  # 7: lives in the hidden ~/.pocketbunty folder
 HOST = "127.0.0.1"  # never 0.0.0.0
 PORT = 8765
-BRIDGE_DIR = os.path.expanduser("~/bridge")
+BRIDGE_DIR = os.path.expanduser("~/.pocketbunty")
 TOKEN_FILE = os.path.join(BRIDGE_DIR, "token")
 HISTORY_CHARS = 256 * 1024  # scrollback kept per session for reconnects
 MAX_ENTRIES = 10000
