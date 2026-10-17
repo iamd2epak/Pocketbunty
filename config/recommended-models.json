@@ -1,7 +1,7 @@
 {
   "version": 1,
   "providers": {
-    "mistral": ["mistral-medium-latest"],
+    "mistral": ["mistral-code-latest"],
     "opencode-go": ["glm-5.3-flash", "deepseek-v4.1-flash"],
     "openrouter": ["nemotron-3.5-super-vl:free"]
   }
