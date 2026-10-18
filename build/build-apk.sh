@@ -1,4 +1,4 @@
-# pocketbunty-build-apk version=1 protocol=1
+# pocketbunty-build-apk version=2 protocol=1
 # shellcheck shell=bash
 # Builds a test APK of a PocketBunty project on GitHub Actions. No AI involved.
 # The app runs it in the project folder (Build APK screen) and reads the "@@" lines it prints:
@@ -8,7 +8,7 @@
 #   @@ERRLOG_BEGIN … @@ERRLOG_END          the failed build's log (last lines)
 #   @@APK <url> <bytes>                    done: the download link
 #   @@FAIL <CODE> <message>                stopped (the app picks buttons by CODE)
-# Input (env): PB_KIND android|androidjava|expo, PB_MODE build|resume, PB_REQUEST (unique id),
+# Input (env): PB_KIND android|androidjava|expo|game, PB_MODE build|resume, PB_REQUEST (unique id),
 #              PB_RUN_ID + PB_REPO (resume: watch a run that's already going).
 # The live copy is fetched from github.com/iamd2epak/pocketbunty (build/build-apk.sh): edit it
 # there and raise "version" to change how every app builds. Keep "protocol=1" unless the @@ lines change.
@@ -33,7 +33,7 @@ last_line() { printf '%s\n' "$1" | sed 's/\r//g' | grep -v '^[[:space:]]*$' | ta
 # Cancel (Stop in the app): stop the run on GitHub too.
 trap 'trap - INT TERM; [ -n "$RUN_ID" ] && [ -n "$REPO" ] && gh run cancel "$RUN_ID" --repo "$REPO" >/dev/null 2>&1; echo "@@FAIL CANCELLED Build cancelled."; exit 130' INT TERM
 
-case "$KIND" in android|androidjava|expo) ;; *) fail KIND "This project type can't be built into an APK here." ;; esac
+case "$KIND" in android|androidjava|expo|game) ;; *) fail KIND "This project type can't be built into an APK here." ;; esac
 
 # ---------------------------------------------------------------- the GitHub workflow (fixed)
 
@@ -73,11 +73,17 @@ jobs:
     steps:
       - name: Get the code
         uses: actions/checkout@v4
-      - name: Set up Java 17
+EOF
+}
+
+# Capacitor 7 (games) needs Java 21; Android Gradle projects and React Native use 17.
+wf_java() {
+cat <<EOF
+      - name: Set up Java $1
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '$1'
 EOF
 }
 
@@ -106,7 +112,8 @@ cat <<'EOF'
 EOF
 }
 
-wf_expo() {
+# Node.js 22, Gradle and the app's packages (npm, yarn or pnpm, as the repo uses).
+wf_node() {
 cat <<'EOF'
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
@@ -127,6 +134,12 @@ cat <<'EOF'
           else
             npm install --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps
           fi
+EOF
+}
+
+wf_expo() {
+wf_node
+cat <<'EOF'
       - name: Make the Android project
         env:
           CI: '1'
@@ -156,6 +169,44 @@ cat <<'EOF'
 EOF
 }
 
+# Web game (Vite/Phaser…) → Android app with Capacitor, made on GitHub only (nothing added to the repo).
+# A committed android/ folder (the game already uses Capacitor) is built as it is.
+wf_game() {
+wf_node
+cat <<'EOF'
+      - name: Build the game
+        run: |
+          cd "$APP_DIR"
+          node -e 'const s=(require("./package.json").scripts||{});process.exit(s.build?0:1)' ||
+            { echo "::error::package.json has no \"build\" script. Ask the AI to add one (vite build)."; exit 1; }
+          npm run build
+          web=
+          for d in dist build www out; do [ -f "$d/index.html" ] && { web="$d"; break; }; done
+          [ -n "$web" ] || { echo "::error::The build made no index.html (looked in dist, build, www, out)."; exit 1; }
+          echo "Web files: $web"
+          echo "WEB_DIR=$web" >> "$GITHUB_ENV"
+      - name: Make the Android app (Capacitor)
+        run: |
+          cd "$APP_DIR"
+          if [ ! -d node_modules/@capacitor/android ] || [ ! -d node_modules/@capacitor/cli ]; then
+            npm install --no-save --no-audit --no-fund --legacy-peer-deps @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          fi
+          if ! ls capacitor.config.* >/dev/null 2>&1; then
+            node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("package.json","utf8"));const repo=process.env.GITHUB_REPOSITORY.split("/")[1];let id=String(p.name||repo).toLowerCase().replace(/[^a-z0-9]/g,"");if(!/^[a-z]/.test(id))id="game"+id;const name=String(p.productName||p.name||repo).replace(/[-_]+/g," ").trim()||"Game";fs.writeFileSync("capacitor.config.json",JSON.stringify({appId:"com.pocketbunty."+id,appName:name,webDir:process.env.WEB_DIR},null,2));console.log("appId = com.pocketbunty."+id)'
+          fi
+          [ -f android/gradlew ] || npx cap add android
+          npx cap sync android
+      - name: Build APK
+        run: |
+          cd "$APP_DIR/android"
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain assembleDebug
+          apk="$(find app/build/outputs/apk/debug -name '*.apk' 2>/dev/null | head -n 1)"
+          [ -n "$apk" ] || { echo "::error::Gradle finished but made no APK."; exit 1; }
+          echo "APK_PATH=$PWD/${apk#./}" >> "$GITHUB_ENV"
+EOF
+}
+
 wf_publish() {
 cat <<'EOF'
       - name: Put the APK on the release
@@ -167,7 +218,16 @@ cat <<'EOF'
           gh release view pocketbunty-apk --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create pocketbunty-apk --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
               --title "Test APK (PocketBunty)" --notes "Test APK built by PocketBunty."
+          # Only the newest APK is kept: older ones are deleted, so they don't fill the repo's storage.
+          gh release view pocketbunty-apk --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+            while IFS= read -r old; do
+              [ -n "$old" ] && gh release delete-asset pocketbunty-apk "$old" --repo "$GITHUB_REPOSITORY" --yes
+            done
           gh release upload pocketbunty-apk "$RUNNER_TEMP/$name" --repo "$GITHUB_REPOSITORY" --clobber
+          # Older PocketBunty versions put APKs on a release "debug": remove it (only if it's that one).
+          if [ "$(gh release view debug --repo "$GITHUB_REPOSITORY" --json name --jq .name 2>/dev/null)" = "Debug APK (testing)" ]; then
+            gh release delete debug --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          fi
           gh release edit pocketbunty-apk --repo "$GITHUB_REPOSITORY" \
             --notes "Test (debug-signed) APK built by PocketBunty from $GITHUB_SHA on $GITHUB_REF_NAME. For testing only."
           url="https://github.com/$GITHUB_REPOSITORY/releases/download/pocketbunty-apk/$name"
@@ -178,7 +238,11 @@ EOF
 
 workflow() {
   wf_head
-  if [ "$KIND" = expo ]; then wf_expo; else wf_android; fi
+  case "$KIND" in
+    expo) wf_java 17; wf_expo ;;
+    game) wf_java 21; wf_game ;;
+    *) wf_java 17; wf_android ;;
+  esac
   wf_publish
 }
 
@@ -192,9 +256,13 @@ is_android_dir() {
 is_expo_dir() {
   [ -f "$1/package.json" ] && { grep -qsE '"(expo|react-native)"' "$1/package.json" || [ -f "$1/android/gradlew" ]; }
 }
+is_game_dir() {
+  [ -f "$1/package.json" ] && grep -qsE '"build"[[:space:]]*:' "$1/package.json"
+}
 find_app_dir() {
   test_fn=is_android_dir
   [ "$KIND" = expo ] && test_fn=is_expo_dir
+  [ "$KIND" = game ] && test_fn=is_game_dir
   if $test_fn .; then echo .; return 0; fi
   for f in $(find . -maxdepth 3 \( -name node_modules -o -name .git -o -name build \) -prune -o \
       \( -name 'settings.gradle*' -o -name package.json \) -print 2>/dev/null | sort); do
@@ -215,7 +283,7 @@ ignore() {
 # ---------------------------------------------------------------- 1. check
 
 step check
-echo "Build script v1 · $KIND"
+echo "Build script v2 · $KIND"
 command -v git >/dev/null 2>&1 || fail NOGIT "git isn't installed. Finish the setup on Home, then build again."
 command -v gh >/dev/null 2>&1 || fail NOGH "GitHub isn't set up yet. Open GitHub on Home and sign in."
 gh auth token -h github.com >/dev/null 2>&1 || fail LOGGEDOUT "You're not signed in to GitHub. Open GitHub on Home and sign in."
@@ -232,6 +300,8 @@ if [ "$MODE" != resume ]; then
   APP_DIR="$(find_app_dir)" || {
     if [ "$KIND" = expo ]; then
       fail NOAPP "No app here yet (no package.json with expo). Describe your app in Chat first, then build."
+    elif [ "$KIND" = game ]; then
+      fail NOAPP "No game here yet (no package.json with a \"build\" script). Describe your game in Chat first, then build."
     else
       fail NOAPP "No Android app here yet (no settings.gradle with an app module). Describe your app in Chat first, then build."
     fi
@@ -263,8 +333,8 @@ if [ "$MODE" != resume ]; then
   [ -n "$(git config user.name)" ] || git config user.name "$LOGIN"
   [ -n "$(git config user.email)" ] || git config user.email "$LOGIN@users.noreply.github.com"
 
-  if [ "$KIND" = expo ]; then
-    ignore node_modules/ .expo/
+  if [ "$KIND" = expo ] || [ "$KIND" = game ]; then
+    if [ "$KIND" = expo ]; then ignore node_modules/ .expo/; else ignore node_modules/ dist/; fi
     nm="${APP_PREFIX}node_modules"
     [ -n "$(git ls-files "$nm" | head -n 1)" ] && git rm -r -q --cached "$nm" && note "Took node_modules out of git"
   else

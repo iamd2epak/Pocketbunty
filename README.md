@@ -14,7 +14,7 @@ Later, to reconnect the app, just type `pocketbunty` in Termux.
 ## Live app config (changes reach the app without an update)
 
 - `config/recommended-models.json`: models shown first ("Recommended") in the model picker.
-- `build/build-apk.sh`: the **Build APK** script (checks, push, GitHub Actions workflow, link).
+- `build/build-apk.sh`: the **Build APK** script (checks, push, GitHub Actions workflow for Android, Expo and games, link).
   When you change it, raise `version=` on its first line. Keep `protocol=1` unless the `@@` lines
   it prints change. The app ignores a copy that is cut off, has another protocol, or is older than
   the one bundled in the app.
