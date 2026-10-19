@@ -91,8 +91,12 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'rm -rf "$LOCK"' EXIT
 
+# The Google Play build of Termux can't install glibc, so the AI coder (jcode) can't run there.
 if [ "${TERMUX_APK_RELEASE:-}" = "GOOGLE_PLAY_STORE" ]; then
-  warn "Termux from Google Play has limits. If something fails, install Termux from F-Droid or GitHub."
+  printf '\n%s✗ This Termux is from Google Play and cannot run the AI coder.%s\n' "$C_ERR" "$C_OFF"
+  printf '  1. Uninstall this Termux.\n  2. Install Termux from GitHub: https://github.com/termux/termux-app/releases/latest\n'
+  printf '     (the file that ends in universal.apk), or from F-Droid.\n  3. Open the new Termux and paste the same command again.\n'
+  exit 1
 fi
 
 # Is this shell running under the bridge (the app's terminal)? Then don't restart the bridge.
