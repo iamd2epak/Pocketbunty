@@ -289,9 +289,11 @@ if oc_works; then
   printf '%s\n' "$OC_VERSION" >"$OC_DIR/version"
   # `opencode` in the Terminal too (same program, without Termux's LD_PRELOAD).
   mkdir -p "$HOME/.local/bin"
-  printf '#!%s/bin/bash\nunset LD_PRELOAD\nexport OPENCODE_DISABLE_AUTOUPDATE=1\nexec "%s" "$@"\n' "$PREFIX" "$OC_BIN" >"$HOME/.local/bin/opencode"
+  # Also fixes OpenCode's name lookups first (glibc DNS, see agent.py dns).
+  printf '#!%s/bin/bash\nunset LD_PRELOAD\nexport OPENCODE_DISABLE_AUTOUPDATE=1\npython "$HOME/.pocketbunty/agent.py" dns >/dev/null 2>&1\nexec "%s" "$@"\n' "$PREFIX" "$OC_BIN" >"$HOME/.local/bin/opencode"
   chmod +x "$HOME/.local/bin/opencode"
   # First start downloads OpenCode's list of AI providers and models (needed for the free models).
+  python "$AGENT" dns >>"$LOG" 2>&1
   quiet timeout 180 env -u LD_PRELOAD OPENCODE_DISABLE_AUTOUPDATE=1 "$OC_BIN" models opencode \
     && ok "free AI models ready" || note "couldn't load the model list now (it loads on the first chat)"
 fi

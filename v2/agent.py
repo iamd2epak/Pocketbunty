@@ -11,6 +11,7 @@ Lives at ~/.pocketbunty/agent.py. The app runs it through the bridge (server.py)
   agent.py add-provider        adds an OpenAI-compatible provider (JSON in $TC_PROMPT)
   agent.py login-start <p>     starts a browser login: prints the page to open
   agent.py login-finish <p>    finishes it (code in $TC_PROMPT, or waits for the approval)
+  agent.py dns                 makes OpenCode's name lookups work on this phone (also done before every run)
   agent.py version
 
 `run` reads: TC_PROMPT (message), TC_SESSION (OpenCode session to continue, may be empty),
@@ -125,6 +126,134 @@ def oc_env(extra=None):
     return env
 
 
+# ---------------------------------------------------------------- DNS for OpenCode
+# OpenCode is a glibc program. glibc looks names up itself, from its own resolv.conf and hosts file
+# ($PREFIX/glibc/etc), not through Android's resolver like Termux's own programs (and Python) do.
+# Often that file is missing or names a DNS server the network blocks, so OpenCode fails with
+# "getaddrinfo EAI_AGAIN chatgpt.com" while the phone's internet works. Before OpenCode starts:
+# 1. the hosts it needs are looked up with Android's resolver and written to glibc's hosts file;
+# 2. glibc's resolv.conf gets public DNS servers that answer on this network, for any other host.
+
+# Hosts the AI providers and OpenCode use (more are added from the chosen provider's settings).
+DNS_HOSTS = [
+    "opencode.ai", "api.opencode.ai", "models.dev", "chatgpt.com", "auth.openai.com", "api.openai.com",
+    "api.anthropic.com", "openrouter.ai", "api.githubcopilot.com", "github.com", "api.github.com",
+    "generativelanguage.googleapis.com", "api.deepseek.com", "api.z.ai", "open.bigmodel.cn", "api.moonshot.ai",
+    "api.kimi.com", "api.mistral.ai", "api.x.ai", "api.groq.com", "api.together.xyz", "api.fireworks.ai",
+    "api.deepinfra.com", "api.cerebras.ai", "integrate.api.nvidia.com", "router.huggingface.co",
+    "api.minimax.io", "dashscope-intl.aliyuncs.com", "llm.chutes.ai", "ollama.com", "registry.npmjs.org",
+]
+PUBLIC_DNS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1", "8.8.4.4", "208.67.222.222"]
+HOSTS_START = "# pocketbunty-dns start (written by PocketBunty for OpenCode; refreshed on every run)"
+HOSTS_END = "# pocketbunty-dns end"
+_dns_done = False
+
+
+def glibc_etc():
+    prefix = os.environ.get("PREFIX") or "/data/data/com.termux/files/usr"
+    return os.path.join(prefix, "glibc", "etc")
+
+
+def dns_answers(server, timeout=1.5):
+    """True when [server] answers a DNS query for opencode.ai on this network (UDP 53)."""
+    query_id = secrets.randbits(16)
+    packet = query_id.to_bytes(2, "big") + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    for label in "opencode.ai".split("."):
+        packet += bytes([len(label)]) + label.encode()
+    packet += b"\x00\x00\x01\x00\x01"
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(packet, (server, 53))
+        data, _ = s.recvfrom(512)
+        return len(data) > 12 and int.from_bytes(data[:2], "big") == query_id and (data[3] & 0x0F) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def provider_hosts():
+    """API hosts of connected and custom providers (from OpenCode's catalog and config)."""
+    hosts = set()
+    names = set(read_json(AUTH_FILE, {})) | set(custom_providers())
+    cat = catalog()
+    for pid in names:
+        entry = custom_providers().get(pid) or {}
+        urls = [((entry.get("options") or {}).get("baseURL") or ""), str((cat.get(pid) or {}).get("api") or "")]
+        for url in urls:
+            m = re.match(r"^https?://([^/:]+)", url)
+            if m and not re.match(r"^[0-9.]+$|^\[|^localhost$", m.group(1).lower()):
+                hosts.add(m.group(1).lower())
+    return hosts
+
+
+def fix_dns():
+    """Makes OpenCode's own name lookups work on this phone (see above). Never fails the run."""
+    global _dns_done
+    if _dns_done:
+        return
+    _dns_done = True
+    try:
+        etc = glibc_etc()
+        if not os.path.isdir(os.path.dirname(etc)):
+            return  # not Termux's glibc (a computer): its own DNS works
+        os.makedirs(etc, exist_ok=True)
+        hosts = sorted(set(DNS_HOSTS) | provider_hosts())
+        found = {}
+        servers = []
+
+        def look(host):
+            try:
+                ips = {a[4][0] for a in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)}
+                if ips:
+                    found[host] = sorted(ips)[:4]
+            except OSError:
+                pass
+
+        def probe(server):
+            if dns_answers(server):
+                servers.append(server)
+
+        threads = [threading.Thread(target=look, args=(h,), daemon=True) for h in hosts]
+        threads += [threading.Thread(target=probe, args=(d,), daemon=True) for d in PUBLIC_DNS]
+        for t in threads:
+            t.start()
+        end = time.time() + 4
+        for t in threads:
+            t.join(max(0.0, end - time.time()))
+
+        # hosts: our block (fresh addresses) + whatever else was there.
+        path = os.path.join(etc, "hosts")
+        try:
+            with open(path) as f:
+                old = f.read()
+        except OSError:
+            old = "127.0.0.1 localhost\n::1 localhost\n"
+        old = re.sub(re.escape(HOSTS_START) + r".*?" + re.escape(HOSTS_END) + r"\n?", "", old, flags=re.S)
+        block = [HOSTS_START] + ["%s %s" % (ip, host) for host in sorted(found) for ip in found[host]] + [HOSTS_END]
+        with open(path + ".tmp", "w") as f:
+            f.write(old.rstrip("\n") + "\n" + "\n".join(block) + "\n")
+        os.replace(path + ".tmp", path)
+
+        # resolv.conf: DNS servers that answer here (kept as they are when none answer).
+        working = [d for d in PUBLIC_DNS if d in servers][:3]
+        if working:
+            with open(os.path.join(etc, "resolv.conf.tmp"), "w") as f:
+                f.write("# Written by PocketBunty: DNS servers that answer on this network.\n")
+                f.writelines("nameserver %s\n" % d for d in working)
+                f.write("options timeout:2 attempts:2\n")
+            os.replace(os.path.join(etc, "resolv.conf.tmp"), os.path.join(etc, "resolv.conf"))
+        with open(os.path.join(DIR, "dns.log"), "w") as f:
+            f.write("hosts: %d of %d resolved\nservers that answer: %s\n" % (len(found), len(hosts), " ".join(working) or "none"))
+    except Exception as e:  # noqa: BLE001 - DNS help must never stop a run
+        try:
+            with open(os.path.join(DIR, "dns.log"), "w") as f:
+                f.write("failed: %s\n" % e)
+        except OSError:
+            pass
+
+
 def die_with_parent():
     """In the child: if this script is killed, the OpenCode server goes too (no leftover server)."""
     try:
@@ -152,6 +281,7 @@ class Server:
         binary = opencode_bin()
         if binary is None:
             raise RuntimeError("OpenCode isn't installed. Run the PocketBunty setup again.")
+        fix_dns()
         extra = {"OPENCODE_SERVER_PASSWORD": self.password}
         if config:
             extra["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
@@ -505,7 +635,15 @@ def run_with(server, prompt, session, provider, model_id, access, variant, stopp
                     error = FREE_LIMIT
                     stopping.set()
                     continue
-                out({"type": "retry", "attempt": status.get("attempt", 0), "message": str(status.get("message", ""))[:300]})
+                message = str(status.get("message", ""))[:300]
+                attempt = int(status.get("attempt", 0) or 0)
+                host = re.search(r"(?:EAI_AGAIN|ENOTFOUND|getaddrinfo)\W+([A-Za-z0-9.-]+\.[a-z]{2,})", message)
+                if (host or re.search(r"ECONNREFUSED|ECONNRESET|ETIMEDOUT|fetch failed|Unable to connect", message)) and attempt >= 2:
+                    error = ("Can't reach %s from OpenCode. Check the internet (or turn off a VPN / Private DNS that blocks it), "
+                             "then tap Retry." % (host.group(1) if host else "the AI provider"))
+                    stopping.set()
+                    continue
+                out({"type": "retry", "attempt": attempt, "message": message})
             elif status.get("type") == "idle" and (busy_seen or aborted_at is not None):
                 break
         elif etype == "session.idle":
@@ -607,6 +745,7 @@ def cmd_models(provider):
     if binary is None:
         fail("OpenCode isn't installed. Run the PocketBunty setup again.", 127)
     try:
+        fix_dns()
         r = subprocess.run([binary, "models", provider], env=oc_env(), cwd=HOME, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         fail("OpenCode took too long to list the models.")
@@ -977,6 +1116,14 @@ def main():
         return cmd_run()
     if cmd == "status":
         return cmd_status()
+    if cmd == "dns":
+        fix_dns()
+        try:
+            with open(os.path.join(DIR, "dns.log")) as f:
+                sys.stdout.write(f.read())
+        except OSError:
+            pass
+        return 0
     if cmd == "add-provider":
         return cmd_add_provider()
     if cmd in ("models", "set-key", "logout", "login-start", "login-finish") and len(rest) == 1:
