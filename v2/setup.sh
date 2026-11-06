@@ -1,14 +1,15 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # PocketBunty setup v2 for Termux (AI coder: OpenCode).
 #
-# One command sets up everything: Termux packages, the bridge (Python + server.py), git, the
-# GitHub CLI and OpenCode, then starts the bridge and opens the app linked. Safe to run again:
-# finished steps are skipped, and it repairs what is missing or broken. Everything lives in one
-# hidden folder, ~/.pocketbunty. It also adds the `pocketbunty` command (reconnects the app).
+# Kept short on purpose: it sets up only the bridge (Termux packages, Python + server.py), starts
+# it and opens the app linked. The app then installs git, the GitHub CLI and OpenCode by itself
+# (env.sh, in the background). Safe to run again: finished steps are skipped, and it repairs what
+# is missing or broken. Everything lives in one hidden folder, ~/.pocketbunty. It also adds the
+# `pocketbunty` command (reconnects the app).
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/iamd2epak/pocketbunty/main/v2/setup.sh)
 #
-# Options: --bridge-only (skip git, GitHub CLI and OpenCode), --reinstall-opencode, --no-start
+# Options: --full (also install git, GitHub CLI and OpenCode here), --reinstall-opencode, --no-start
 
 set -u
 set -o pipefail
@@ -23,14 +24,14 @@ PORT=8765
 APP_LINK="termichat://link"
 
 ENV_ARGS=()
-WANT_ENV=true
+WANT_ENV=false
 WANT_START=true
 for arg in "$@"; do
   case "$arg" in
     --bridge-only|--no-jcode) WANT_ENV=false ;;
-    --reinstall-opencode|--update-jcode) ENV_ARGS+=(--reinstall-opencode) ;;
+    --reinstall-opencode|--update-jcode) WANT_ENV=true; ENV_ARGS+=(--reinstall-opencode) ;;
     --no-start) WANT_START=false ;;
-    --full) ;;
+    --full) WANT_ENV=true ;;
   esac
 done
 
@@ -93,7 +94,7 @@ run_retry() {
 mkdir -p "$BRIDGE_DIR" 2>/dev/null
 : >"$LOG" 2>/dev/null || LOG=/dev/null
 [ "$WANT_ENV" = true ] || STEPS=5
-banner "🐰  PocketBunty setup" "Takes 3-10 minutes. Keep Termux open."
+banner "🐰  PocketBunty setup" "About 1-3 minutes. Keep Termux open."
 
 if [ -z "${PREFIX:-}" ] || [ ! -d "${PREFIX:-/nonexistent}" ] || ! have apt-get; then
   die "this script must run inside the Termux app."
@@ -113,8 +114,10 @@ case "$(uname -m)" in
 esac
 
 free_kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
-if [ -n "$free_kb" ] && [ "$free_kb" -lt 716800 ] 2>/dev/null; then
-  die "not enough free storage: need about 700 MB, this phone has $((free_kb / 1024)) MB free. Free some space first."
+if [ -n "$free_kb" ] && [ "$free_kb" -lt 102400 ] 2>/dev/null; then
+  die "not enough free storage: need at least 100 MB, this phone has $((free_kb / 1024)) MB free. Free some space first."
+elif [ -n "$free_kb" ] && [ "$free_kb" -lt 716800 ] 2>/dev/null; then
+  warn "only $((free_kb / 1024)) MB free: the AI coder needs about 700 MB later. Free some space."
 fi
 
 # One setup at a time.
@@ -142,8 +145,6 @@ inside_bridge() {
   return 1
 }
 
-# Keep Android from pausing Termux while installing.
-have termux-wake-lock && timeout 10 termux-wake-lock >/dev/null 2>&1
 
 # ---------- 1. Termux packages ----------
 export DEBIAN_FRONTEND=noninteractive
@@ -345,23 +346,27 @@ if [ "$WANT_START" = true ]; then
   fi
 fi
 
-# ---------- summary ----------
-if [ ${#PROBLEMS[@]} -eq 0 ]; then
-  banner "✓  All set!" "Going back to the app…"
-  printf '  Next time just open Termux, or type: %spocketbunty%s\n\n' "$C_BOLD" "$C_OFF"
-else
-  printf '\n%s┌─ Setup finished with %d problem(s) ─┐%s\n' "$C_WARN" "${#PROBLEMS[@]}" "$C_OFF"
-  for p in "${PROBLEMS[@]}"; do printf '  %s•%s %s\n' "$C_WARN" "$C_OFF" "$p"; done
-  printf '  Paste the same command again to retry. Log: %s\n\n' "$LOG"
+# ---------- link and summary ----------
+linked=false
+if [ "$WANT_START" = true ]; then
+  step "Opening the app"
+  if [ "$started" = true ] && have am && am start -a android.intent.action.VIEW -d "$APP_LINK?token=$TOKEN" >>"$LOG" 2>&1; then
+    linked=true
+    ok "PocketBunty opened"
+  fi
 fi
 
-if [ "$WANT_START" = true ]; then
-  step "Linking the app"
-  if [ "$started" = true ] && have am && am start -a android.intent.action.VIEW -d "$APP_LINK?token=$TOKEN" >>"$LOG" 2>&1; then
-    ok "app opened and linked"
-  else
-    warn "open the PocketBunty app and paste this token:"
-    printf '\n      %s%s%s\n\n' "$C_WARN" "$TOKEN" "$C_OFF"
-  fi
+if [ ${#PROBLEMS[@]} -gt 0 ]; then
+  printf '\n%s┌─ Setup finished with %d problem(s) ─┐%s\n' "$C_WARN" "${#PROBLEMS[@]}" "$C_OFF"
+  for p in "${PROBLEMS[@]}"; do printf '  %s•%s %s\n' "$C_WARN" "$C_OFF" "$p"; done
+  printf '  Paste the same command again to retry. Log: %s\n' "$LOG"
+fi
+if [ "$started" = true ]; then
+  banner "✓  Bridge ready!" "The app installs the AI coder next."
+  # Android may not let Termux open the app (e.g. the screen was off): the code always works.
+  printf '  If PocketBunty didn'"'"'t open, open it and enter this code:\n\n'
+  printf '      %s%s%s\n\n' "$C_BOLD$C_WARN" "$TOKEN" "$C_OFF"
+  [ "$linked" = true ] || note "Tap the code to copy it (long-press → Copy)."
+  printf '  Next time just open Termux, or type: %spocketbunty%s\n\n' "$C_BOLD" "$C_OFF"
 fi
 exit 0
