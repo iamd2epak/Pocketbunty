@@ -232,18 +232,20 @@ def fix_dns():
             old = "127.0.0.1 localhost\n::1 localhost\n"
         old = re.sub(re.escape(HOSTS_START) + r".*?" + re.escape(HOSTS_END) + r"\n?", "", old, flags=re.S)
         block = [HOSTS_START] + ["%s %s" % (ip, host) for host in sorted(found) for ip in found[host]] + [HOSTS_END]
-        with open(path + ".tmp", "w") as f:
+        tmp = "%s.%d.tmp" % (path, os.getpid())  # two chats at once each write their own
+        with open(tmp, "w") as f:
             f.write(old.rstrip("\n") + "\n" + "\n".join(block) + "\n")
-        os.replace(path + ".tmp", path)
+        os.replace(tmp, path)
 
         # resolv.conf: DNS servers that answer here (kept as they are when none answer).
         working = [d for d in PUBLIC_DNS if d in servers][:3]
         if working:
-            with open(os.path.join(etc, "resolv.conf.tmp"), "w") as f:
+            tmp = os.path.join(etc, "resolv.conf.%d.tmp" % os.getpid())
+            with open(tmp, "w") as f:
                 f.write("# Written by PocketBunty: DNS servers that answer on this network.\n")
                 f.writelines("nameserver %s\n" % d for d in working)
                 f.write("options timeout:2 attempts:2\n")
-            os.replace(os.path.join(etc, "resolv.conf.tmp"), os.path.join(etc, "resolv.conf"))
+            os.replace(tmp, os.path.join(etc, "resolv.conf"))
         with open(os.path.join(DIR, "dns.log"), "w") as f:
             f.write("hosts: %d of %d resolved\nservers that answer: %s\n" % (len(found), len(hosts), " ".join(working) or "none"))
     except Exception as e:  # noqa: BLE001 - DNS help must never stop a run
@@ -546,6 +548,8 @@ def run_with(server, prompt, session, provider, model_id, access, variant, stopp
         etype = ev.get("type", "")
         props = ev.get("properties") or {}
         if etype == "pb.stream_end":
+            if server.proc.poll() is not None and aborted_at is None:
+                error = error or "OpenCode stopped unexpectedly. Tap Retry. (Log: ~/.pocketbunty/opencode-server.log)"
             break
         if etype == "pb.stream_error":
             if server.proc.poll() is not None:
