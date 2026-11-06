@@ -67,8 +67,9 @@ POPULAR = [
     ("fireworks-ai", "Fireworks AI"), ("deepinfra", "DeepInfra"), ("cerebras", "Cerebras"),
     ("nvidia", "NVIDIA"), ("huggingface", "Hugging Face"), ("chutes", "Chutes"), ("ollama-cloud", "Ollama Cloud"),
 ]
-# Providers whose login is a browser/device login (OpenCode's OAuth), not only a key.
-OAUTH = {"openai", "github-copilot", "gitlab", "poe"}
+# Providers with a browser/device login (OpenCode's OAuth): only that, or that or an API key.
+OAUTH_ONLY = {"github-copilot"}
+OAUTH_OR_KEY = {"openai", "gitlab", "poe"}
 
 
 # ---------------------------------------------------------------- small helpers
@@ -161,7 +162,8 @@ class Server:
         except OSError:
             pass
         self.log = open(log_path, "ab")
-        cmd = [binary, "serve", "--port", str(self.port), "--hostname", "127.0.0.1"]
+        # Warnings and errors go to the log, so a failure can say why (see server_error).
+        cmd = [binary, "serve", "--port", str(self.port), "--hostname", "127.0.0.1", "--print-logs", "--log-level", "WARN"]
         if detached and shutil.which("timeout"):
             cmd = ["timeout", "900"] + cmd  # a login nobody finishes doesn't keep a server forever
         self.proc = subprocess.Popen(
@@ -185,7 +187,7 @@ class Server:
         finally:
             conn.close()
 
-    def wait_ready(self, seconds=90):
+    def wait_ready(self, seconds=120):
         end = time.time() + seconds
         while time.time() < end:
             if self.proc.poll() is not None:
@@ -242,12 +244,32 @@ class Server:
                     pass
 
 
+def server_error(ref=None):
+    """The reason OpenCode logged for its last error ("Unexpected server error" says nothing)."""
+    try:
+        with open(os.path.join(DIR, "opencode-server.log"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if "level=ERROR" not in line or (ref and ref not in line):
+            continue
+        m = re.search(r'error="(?:Error: )?([^"\\]{1,200})', line)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def error_text(err):
     """OpenCode error object -> one readable line."""
     if not isinstance(err, dict):
         return str(err or "Unknown error")
     data = err.get("data") if isinstance(err.get("data"), dict) else {}
     msg = data.get("message") or err.get("message") or err.get("name") or "Unknown error"
+    if "Unexpected server error" in str(msg):
+        msg = server_error(data.get("ref")) or msg
     body = data.get("responseBody") or ""
     if "FreeUsageLimitError" in body or "Free usage limit" in str(msg):
         return FREE_LIMIT
@@ -555,7 +577,7 @@ def cmd_status():
             return
         seen.add(pid)
         info = auth.get(pid) if isinstance(auth.get(pid), dict) else None
-        kind = "OAuth" if pid in OAUTH else "API key"
+        kind = "OAuth" if pid in OAUTH_ONLY else "OAuth or API key" if pid in OAUTH_OR_KEY else "API key"
         if pid == "opencode":
             # Free models work without any login.
             rows.append({"id": pid, "name": name, "status": "available", "method": "free models" if not info else "API key",
@@ -712,11 +734,156 @@ def end_login():
         pass
 
 
+# ---- device logins done here, without OpenCode (same steps as its built-in plugins) ----
+# OpenCode's server makes these requests with Bun, which can fail on some phones ("Unexpected
+# server error"); Python's own network code is reliable in Termux. The result is saved in
+# OpenCode's auth file exactly like OpenCode saves it.
+
+OPENAI_ISSUER = "https://auth.openai.com"
+OPENAI_CLIENT = "app_EMoamEEZ73f0CkXaXp7hrann"
+COPILOT_CLIENT = "Ov23li8tweQw6odWQebz"
+NATIVE_LOGINS = {"openai", "github-copilot"}
+UA = "opencode/1.19.5"
+
+
+def http(method, url, data=None, form=False, timeout=30):
+    """(status, parsed JSON or text). Network failures raise RuntimeError with a readable reason."""
+    import urllib.error
+    import urllib.request
+    headers = {"User-Agent": UA, "Accept": "application/json"}
+    body = None
+    if data is not None:
+        if form:
+            import urllib.parse
+            body = urllib.parse.urlencode(data).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        host = url.split("/")[2]
+        raise RuntimeError("Couldn't reach %s (%s). Check the internet and try again." % (host, reason))
+    try:
+        return status, json.loads(raw.decode("utf-8", "replace")) if raw else {}
+    except ValueError:
+        return status, raw.decode("utf-8", "replace")[:300]
+
+
+def jwt_claims(token):
+    try:
+        part = token.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except Exception:  # noqa: BLE001 - not a JWT
+        return {}
+
+
+def openai_account(tokens):
+    for key in ("id_token", "access_token"):
+        claims = jwt_claims(tokens.get(key) or "")
+        account = (claims.get("chatgpt_account_id") or (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+                   or ((claims.get("organizations") or [{}])[0] or {}).get("id"))
+        if account:
+            return account
+    return None
+
+
+def save_oauth(provider, info):
+    auth = read_json(AUTH_FILE, {})
+    auth[provider] = dict({"type": "oauth"}, **info)
+    write_json(AUTH_FILE, auth, private=True)
+
+
+def native_login_start(provider):
+    if provider == "openai":
+        status, data = http("POST", OPENAI_ISSUER + "/api/accounts/deviceauth/usercode", {"client_id": OPENAI_CLIENT})
+        if status != 200 or not isinstance(data, dict) or not data.get("user_code"):
+            fail("OpenAI didn't start the login (HTTP %s). Try again in a minute." % status)
+        state = {"provider": provider, "native": True, "device_auth_id": data["device_auth_id"], "user_code": data["user_code"],
+                 "interval": max(int(str(data.get("interval") or 5)), 1)}
+        url = OPENAI_ISSUER + "/codex/device"
+    else:
+        status, data = http("POST", "https://github.com/login/device/code", {"client_id": COPILOT_CLIENT, "scope": "read:user"})
+        if status != 200 or not isinstance(data, dict) or not data.get("device_code"):
+            fail("GitHub didn't start the login (HTTP %s). Try again in a minute." % status)
+        state = {"provider": provider, "native": True, "device_code": data["device_code"], "user_code": data["user_code"],
+                 "interval": max(int(data.get("interval") or 5), 1)}
+        url = data.get("verification_uri") or "https://github.com/login/device"
+    state["expires"] = time.time() + 15 * 60
+    write_json(LOGIN_FILE, state, private=True)
+    out({"status": "pending", "provider": provider, "auth_url": url, "input_kind": "complete",
+         "user_code": state["user_code"], "instructions": "Enter code: " + state["user_code"],
+         "expires_at_ms": int(state["expires"] * 1000)})
+    return 0
+
+
+def native_login_finish(provider, state):
+    """Waits (≤ 280 s) until the user approves the code on the page, then saves the login."""
+    end = min(time.time() + 280, state.get("expires", 0))
+    interval = state.get("interval", 5)
+    while time.time() < end:
+        if provider == "openai":
+            status, data = http("POST", OPENAI_ISSUER + "/api/accounts/deviceauth/token",
+                                {"device_auth_id": state["device_auth_id"], "user_code": state["user_code"]})
+            if status == 200 and isinstance(data, dict) and data.get("authorization_code"):
+                status, tokens = http("POST", OPENAI_ISSUER + "/oauth/token", {
+                    "grant_type": "authorization_code", "code": data["authorization_code"],
+                    "redirect_uri": OPENAI_ISSUER + "/deviceauth/callback", "client_id": OPENAI_CLIENT,
+                    "code_verifier": data.get("code_verifier", ""),
+                }, form=True)
+                if status != 200 or not isinstance(tokens, dict) or not tokens.get("access_token"):
+                    fail("OpenAI login failed at the last step (HTTP %s). Tap Start again." % status)
+                info = {"refresh": tokens.get("refresh_token", ""), "access": tokens["access_token"],
+                        "expires": int((time.time() + int(tokens.get("expires_in") or 3600)) * 1000)}
+                account = openai_account(tokens)
+                if account:
+                    info["accountId"] = account
+                save_oauth("openai", info)
+                return
+            if status not in (403, 404):
+                fail("OpenAI login failed (HTTP %s). Tap Start again." % status)
+        else:
+            status, data = http("POST", "https://github.com/login/oauth/access_token", {
+                "client_id": COPILOT_CLIENT, "device_code": state["device_code"],
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            })
+            if status != 200 or not isinstance(data, dict):
+                fail("GitHub login failed (HTTP %s). Tap Start again." % status)
+            if data.get("access_token"):
+                save_oauth("github-copilot", {"refresh": data["access_token"], "access": data["access_token"], "expires": 0})
+                return
+            err = data.get("error")
+            if err == "slow_down":
+                interval = int(data.get("interval") or interval + 5)
+            elif err == "expired_token":
+                fail("The code expired. Tap Start again.")
+            elif err == "access_denied":
+                fail("The login was cancelled on GitHub.")
+            elif err != "authorization_pending":
+                fail("GitHub login failed: %s" % (data.get("error_description") or err or "unknown"))
+        time.sleep(interval + 3)
+    fail("Login wasn't approved in time. Tap Start again.")
+
+
 def cmd_login_start(provider):
     if not PROVIDER_ID.match(provider):
         fail("Bad provider name")
     end_login()
-    server = Server(HOME, detached=True)
+    if provider in NATIVE_LOGINS:
+        try:
+            return native_login_start(provider)
+        except RuntimeError as e:
+            fail(str(e))
+    try:
+        server = Server(HOME, detached=True)
+    except RuntimeError as e:
+        fail(str(e), 127)
     try:
         server.wait_ready()
         status, methods = server.request("GET", "/provider/auth")
@@ -736,7 +903,10 @@ def cmd_login_start(provider):
                 raise RuntimeError("This login asks for more details: use the Terminal (opencode auth login).")
         status, auth = server.request("POST", "/provider/%s/oauth/authorize" % provider, {"method": index, "inputs": inputs})
         if status != 200 or not isinstance(auth, dict) or not auth.get("url"):
-            raise RuntimeError("Couldn't start the login: %s" % (error_text(auth) if isinstance(auth, dict) else str(auth)[:200]))
+            why = error_text(auth) if isinstance(auth, dict) else str(auth)[:200]
+            if "device authorization" in why.lower() or "fetch" in why.lower():
+                why += " (check the internet connection and try again)"
+            raise RuntimeError("Couldn't start the login: %s" % why)
         code = re.search(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,})\b", auth.get("instructions") or "")
         write_json(LOGIN_FILE, {"pid": server.proc.pid, "port": server.port, "password": server.password,
                                 "provider": provider, "method": index, "kind": auth.get("method")}, private=True)
@@ -750,12 +920,27 @@ def cmd_login_start(provider):
             "expires_at_ms": int((time.time() + 10 * 60) * 1000),
         })
         return 0
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:
         server.stop()
-        fail(str(e))
+        fail(str(e) if isinstance(e, RuntimeError) else "Couldn't reach OpenCode: %s" % e)
 
 
 def cmd_login_finish(provider):
+    state = read_json(LOGIN_FILE, {})
+    if state.get("native"):
+        if state.get("provider") != provider or time.time() > state.get("expires", 0):
+            fail("This login expired. Tap Start again.")
+        try:
+            native_login_finish(provider, state)
+        except RuntimeError as e:
+            fail(str(e))
+        finally:
+            try:
+                os.remove(LOGIN_FILE)
+            except OSError:
+                pass
+        out({"status": "done", "provider": provider})
+        return 0
     server, info = login_server()
     if server is None or info.get("provider") != provider:
         fail("This login expired. Tap Start again.")
@@ -767,10 +952,11 @@ def cmd_login_finish(provider):
         m = re.search(r"[?&]code=([^&#\s]+)", code)
         body["code"] = m.group(1) if m else code
     try:
-        status, resp = server.request("POST", "/provider/%s/oauth/callback" % provider, body, timeout=300)
+        # A device login waits here until the user approves it on the page.
+        status, resp = server.request("POST", "/provider/%s/oauth/callback" % provider, body, timeout=280)
     except OSError as e:
         end_login()
-        fail("Login failed: %s" % e)
+        fail("Login wasn't approved in time. Tap Start again." if isinstance(e, socket.timeout) else "Login failed: %s" % e)
     end_login()
     if status >= 300:
         fail("Login failed: %s" % (error_text(resp) if isinstance(resp, dict) else str(resp)[:200]))
