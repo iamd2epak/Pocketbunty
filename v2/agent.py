@@ -746,7 +746,7 @@ NATIVE_LOGINS = {"openai", "github-copilot"}
 UA = "opencode/1.19.5"
 
 
-def http(method, url, data=None, form=False, timeout=30):
+def web(method, url, data=None, form=False, timeout=30):
     """(status, parsed JSON or text). Network failures raise RuntimeError with a readable reason."""
     import urllib.error
     import urllib.request
@@ -802,14 +802,14 @@ def save_oauth(provider, info):
 
 def native_login_start(provider):
     if provider == "openai":
-        status, data = http("POST", OPENAI_ISSUER + "/api/accounts/deviceauth/usercode", {"client_id": OPENAI_CLIENT})
+        status, data = web("POST", OPENAI_ISSUER + "/api/accounts/deviceauth/usercode", {"client_id": OPENAI_CLIENT})
         if status != 200 or not isinstance(data, dict) or not data.get("user_code"):
             fail("OpenAI didn't start the login (HTTP %s). Try again in a minute." % status)
         state = {"provider": provider, "native": True, "device_auth_id": data["device_auth_id"], "user_code": data["user_code"],
                  "interval": max(int(str(data.get("interval") or 5)), 1)}
         url = OPENAI_ISSUER + "/codex/device"
     else:
-        status, data = http("POST", "https://github.com/login/device/code", {"client_id": COPILOT_CLIENT, "scope": "read:user"})
+        status, data = web("POST", "https://github.com/login/device/code", {"client_id": COPILOT_CLIENT, "scope": "read:user"})
         if status != 200 or not isinstance(data, dict) or not data.get("device_code"):
             fail("GitHub didn't start the login (HTTP %s). Try again in a minute." % status)
         state = {"provider": provider, "native": True, "device_code": data["device_code"], "user_code": data["user_code"],
@@ -829,10 +829,10 @@ def native_login_finish(provider, state):
     interval = state.get("interval", 5)
     while time.time() < end:
         if provider == "openai":
-            status, data = http("POST", OPENAI_ISSUER + "/api/accounts/deviceauth/token",
+            status, data = web("POST", OPENAI_ISSUER + "/api/accounts/deviceauth/token",
                                 {"device_auth_id": state["device_auth_id"], "user_code": state["user_code"]})
             if status == 200 and isinstance(data, dict) and data.get("authorization_code"):
-                status, tokens = http("POST", OPENAI_ISSUER + "/oauth/token", {
+                status, tokens = web("POST", OPENAI_ISSUER + "/oauth/token", {
                     "grant_type": "authorization_code", "code": data["authorization_code"],
                     "redirect_uri": OPENAI_ISSUER + "/deviceauth/callback", "client_id": OPENAI_CLIENT,
                     "code_verifier": data.get("code_verifier", ""),
@@ -849,7 +849,7 @@ def native_login_finish(provider, state):
             if status not in (403, 404):
                 fail("OpenAI login failed (HTTP %s). Tap Start again." % status)
         else:
-            status, data = http("POST", "https://github.com/login/oauth/access_token", {
+            status, data = web("POST", "https://github.com/login/oauth/access_token", {
                 "client_id": COPILOT_CLIENT, "device_code": state["device_code"],
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
             })
