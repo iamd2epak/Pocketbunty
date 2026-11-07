@@ -1784,22 +1784,31 @@ function strictSchema(schema, depth = 0) {
     const seen = new Set();
     const list = values.filter((v) => v !== null && typeof v !== "object" && !seen.has(JSON.stringify(v)) && seen.add(JSON.stringify(v)));
     if (list.length) {
-      if (list.every((v) => typeof v === "string")) { out.enum = list; if (!out.type) out.type = "string"; }
+      if (list.every((v) => typeof v === "string")) { out.enum = list; out.type = "string"; }
       else notes.push("one of: " + list.map(String).join(", "));
     }
   }
   for (const key of ["minimum", "maximum"]) if (typeof schema[key] === "number" && (out.type === "number" || out.type === "integer")) out[key] = schema[key];
   const variants = [schema.anyOf, schema.oneOf].find((v) => Array.isArray(v) && v.length);
   if (variants && !out.type) {
-    const kept = variants.filter((v) => v && typeof v === "object" && v.type !== "null").map((v) => strictSchema(v, depth + 1))
-      .filter((v) => Object.keys(v).length);
-    if (kept.length === 1) Object.assign(out, kept[0], out.description ? { description: out.description } : {});
-    else if (kept.length > 1 && kept.every((v) => v.type === "object")) {
-      // Different object shapes: one object with every field, none required.
+    // Antigravity turns these into Claude's format and can't carry unions: keep one shape.
+    const kept = variants.filter((v) => v && typeof v === "object" && v.type !== "null").map((v) => strictSchema(v, depth + 1));
+    const names = [...new Set(kept.map((v) => v.type))];
+    if (kept.length && kept.every((v) => Array.isArray(v.enum))) {
+      out.type = "string";
+      out.enum = [...new Set(kept.flatMap((v) => v.enum))];
+    } else if (kept.length > 1 && kept.every((v) => v.type === "object")) {
       out.type = "object";
       out.properties = Object.assign({}, ...kept.map((v) => v.properties || {}));
       out.required = [];
-    } else if (kept.length > 1) out.anyOf = kept;
+    } else if (kept.length) {
+      const rank = ["object", "array", "string", "number", "integer", "boolean"];
+      const best = kept.slice().sort((a, b) => rank.indexOf(a.type) - rank.indexOf(b.type))[0];
+      const desc = out.description;
+      Object.assign(out, best);
+      if (desc) out.description = desc + (best.description && best.description !== desc ? " (" + best.description + ")" : "");
+      if (names.length > 1) notes.push("accepts: " + names.join(" | "));
+    }
   }
   if (Array.isArray(schema.allOf)) {
     for (const part of schema.allOf) {
@@ -1823,7 +1832,14 @@ function strictSchema(schema, depth = 0) {
   } else delete out.required;
   if (out.type === "array") {
     const items = Array.isArray(schema.items) ? schema.items[0] : schema.items;
-    out.items = strictSchema(items, depth + 1);
+    out.items = strictSchema(items && typeof items === "object" ? items : { type: "string" }, depth + 1);
+  }
+  if (!out.type) out.type = out.items ? "array" : "string";
+  if (out.type === "object" && !Object.keys(out.properties || {}).length) {
+    // An empty object can't be described to Claude: one optional placeholder field.
+    out.properties = { _placeholder: { type: "boolean", description: "Placeholder. Leave out or pass true." } };
+    delete out.required;
+    if (schema.additionalProperties) notes.push("an object with any keys");
   }
   if (typeof schema.format === "string" && schema.format) notes.push("format: " + schema.format);
   if (notes.length) out.description = ((out.description ? out.description + " " : "") + "(" + notes.join("; ") + ")").slice(0, 1600);
@@ -1832,12 +1848,8 @@ function strictSchema(schema, depth = 0) {
 
 function toolSchema(schema) {
   const s = strictSchema(schema);
-  s.type = "object";
-  delete s.anyOf;
-  if (!s.properties || !Object.keys(s.properties).length) {
-    s.properties = { _placeholder: { type: "boolean", description: "Placeholder. Always pass true." } };
-    s.required = ["_placeholder"];
-  }
+  if (s.type !== "object") return { type: "object", properties: { _placeholder: { type: "boolean", description: "Placeholder. Always pass true." } }, required: ["_placeholder"] };
+  if (Object.keys(s.properties).length === 1 && s.properties._placeholder) s.required = ["_placeholder"];
   return s;
 }
 
@@ -1981,9 +1993,9 @@ function unwrapStream(res) {
   return new Response(body, { status: res.status, statusText: res.statusText, headers: cleanHeaders(res) });
 }
 
-async function errorResponse(res) {
-  const text = await res.text().catch(() => "");
-  let message = text.slice(0, 400);
+function errorResponse(status, text) {
+  const res = { status };
+  let message = String(text || "").slice(0, 400);
   try {
     const e = JSON.parse(text);
     message = (e.error && e.error.message) || e.message || message;
@@ -1995,6 +2007,20 @@ async function errorResponse(res) {
     { status: res.status, headers: { "content-type": "application/json" } });
 }
 
+// Tools Claude refused (bad schema), by name: left out of later requests too, so the chat goes on.
+const refusedTools = new Set();
+
+function dropTools(request, test) {
+  for (const t of request.tools || []) {
+    if (Array.isArray(t.functionDeclarations)) t.functionDeclarations = t.functionDeclarations.filter((d, i) => !test(d, i));
+  }
+  request.tools = (request.tools || []).filter((t) => !Array.isArray(t.functionDeclarations) || t.functionDeclarations.length);
+  if (!request.tools.length) {
+    delete request.tools;
+    delete request.toolConfig;
+  }
+}
+
 async function antigravityFetch(getAuth, client, input, init) {
   const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   const m = /\/models\/([^/:?]+):(streamGenerateContent|generateContent|countTokens)/.exec(url);
@@ -2003,25 +2029,43 @@ async function antigravityFetch(getAuth, client, input, init) {
   const stream = action === "streamGenerateContent";
   let body = init && init.body;
   if (body && typeof body !== "string") body = await new Response(body).text();
-  const wrapped = JSON.stringify({ project: "", model, request: prepare(model, body), requestType: "agent",
-    userAgent: "antigravity", requestId: "agent-" + crypto.randomUUID() });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { access, project } = await accessToken(getAuth, client, attempt > 0);
-    const payload = wrapped.replace('"project":""', '"project":' + JSON.stringify(project || "rising-fact-p41fc"));
+  const request = prepare(model, body);
+  if (!model.startsWith("gemini")) dropTools(request, (d) => refusedTools.has(d.name));
+  const requestId = "agent-" + crypto.randomUUID();
+  let refreshed = false;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const { access, project } = await accessToken(getAuth, client, refreshed);
     const res = await fetch(ENDPOINT + "/v1internal:" + action + (stream ? "?alt=sse" : ""), {
       method: "POST",
       headers: { Authorization: "Bearer " + access, "Content-Type": "application/json", "User-Agent": USER_AGENT,
         Accept: stream ? "text/event-stream" : "application/json" },
-      body: payload,
+      body: JSON.stringify({ project: project || "rising-fact-p41fc", model, request, requestType: "agent",
+        userAgent: "antigravity", requestId }),
       signal: init && init.signal,
     });
-    if (res.status === 401 && attempt === 0) continue;
-    if (!res.ok) return errorResponse(res);
+    if (res.status === 401 && !refreshed) {
+      refreshed = true;
+      continue;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      const bad = res.status === 400 && /tools\.(\d+)\.custom\.input_schema/.exec(text);
+      const decls = ((request.tools || [])[0] || {}).functionDeclarations || [];
+      if (bad && decls[Number(bad[1])]) {
+        const name = decls[Number(bad[1])].name;
+        refusedTools.add(name);
+        console.error("[pocketbunty-antigravity] the model refused the tool " + name + " (schema); continuing without it");
+        dropTools(request, (d) => d.name === name);
+        continue;
+      }
+      return errorResponse(res.status, text);
+    }
     if (stream) return unwrapStream(res);
     const data = await res.json();
     return new Response(JSON.stringify(data && data.response ? data.response : data),
       { status: 200, headers: { "content-type": "application/json" } });
   }
+  return errorResponse(500, "Antigravity kept refusing this request. Try another model.");
 }
 
 export const PocketBuntyAntigravity = async ({ client }) => ({

@@ -135,6 +135,12 @@ class FakeAntigravity(BaseHTTPRequestHandler):
                                "agentModelSorts": [{"groups": [{"modelIds": ["gemini-3-flash", "claude-sonnet-4-6", "gpt-oss-120b-medium", "old-model"]}]}]})
         if self.path == "/v1internal:streamGenerateContent?alt=sse":
             body = json.loads(raw)
+            decls = [d["name"] for t in body["request"].get("tools") or [] for d in t.get("functionDeclarations") or []]
+            if body["model"].startswith("claude") and "glob" in decls:
+                # Like Claude behind Antigravity refusing one tool's schema.
+                msg = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
+                                  "message": "tools.%d.custom.input_schema: JSON schema is invalid." % decls.index("glob")}})
+                return self.reply({"error": {"code": 400, "message": msg, "status": "INVALID_ARGUMENT"}}, 400)
             contents = body["request"]["contents"]
             asked = json.dumps(contents[-1])
             answered = any("functionResponse" in p for c in contents for p in c["parts"])
@@ -192,6 +198,7 @@ class AgentTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.provider.shutdown()
         cls.ag.shutdown()
+        subprocess.run(["pkill", "-f", "agent.py ag-callback"], capture_output=True)  # a login left waiting
 
     def agent(self, *args, prompt="", extra=None, check=False, timeout=180):
         env = dict(self.env, TC_PROMPT=prompt, **(extra or {}))
@@ -429,6 +436,10 @@ class AgentTest(unittest.TestCase):
                     import jsonschema
                 except ImportError:
                     jsonschema = None
+                names = [d["name"] for d in replay[0]["request"]["tools"][0]["functionDeclarations"]]
+                self.assertIn("write", names)
+                if model.startswith("claude"):
+                    self.assertNotIn("glob", names, "the refused tool is left out")
                 for decl in replay[0]["request"]["tools"][0]["functionDeclarations"]:
                     if jsonschema:
                         jsonschema.Draft202012Validator.check_schema(decl["parameters"])
