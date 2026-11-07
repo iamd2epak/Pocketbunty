@@ -238,13 +238,16 @@ class AgentTest(unittest.TestCase):
                                                     "body": "Always say BUNNY-SKILL."}), check=True)
         self.agent("skill-add", prompt=json.dumps({"content": "---\nname: pasted-one\ndescription: 'Pasted: works'\n---\nBody"}), check=True)
         self.assertNotEqual(self.agent("skill-add", prompt=json.dumps({"name": "x", "body": "no description"})).returncode, 0)
+        self.agent("skill-add", prompt=json.dumps({"content": "---\ndescription: From a file\n---\nBody", "fallback_id": "My File"}), check=True)
+        self.assertNotEqual(self.agent("skill-add", prompt=json.dumps({"content": "---\ndescription: d\n---\nB", "fallback_id": "SKILL"})).returncode, 0)
+        self.assertNotEqual(self.agent("skill-add", prompt=json.dumps({"content": "no header"})).returncode, 0)
         ex = json.loads(self.agent("extras", check=True).stdout)
         mcp = {m["name"]: m for m in ex["mcp"]}
         self.assertEqual(mcp["docs"]["enabled"], False)
         self.assertEqual(mcp["docs"]["headers"], ["X-Api-Key"])
         self.assertEqual(mcp["tools"]["target"], "definitely-missing-mcp --flag a b")
         self.assertEqual({s["id"]: s["description"] for s in ex["skills"]},
-                         {"tap-counter-style": "Use for counter apps.", "pasted-one": "Pasted: works"})
+                         {"tap-counter-style": "Use for counter apps.", "pasted-one": "Pasted: works", "my-file": "From a file"})
         cfg_file = os.path.join(self.home, ".config", "opencode", "opencode.json")
         self.assertEqual(os.stat(cfg_file).st_mode & 0o777, 0o600)
         # OpenCode accepts the config (a broken MCP server doesn't stop the chat) and sees the skills.
@@ -259,6 +262,7 @@ class AgentTest(unittest.TestCase):
         self.agent("mcp-remove", "tools", check=True)
         self.agent("skill-remove", "tap-counter-style", check=True)
         self.agent("skill-remove", "pasted-one", check=True)
+        self.agent("skill-remove", "my-file", check=True)
         ex = json.loads(self.agent("extras", check=True).stdout)
         self.assertEqual((ex["mcp"], ex["skills"]), ([], []))
         self.assertNotEqual(self.agent("skill-remove", "../x").returncode, 0)

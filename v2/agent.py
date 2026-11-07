@@ -985,36 +985,87 @@ def cmd_mcp_set(name, action):
     return 0
 
 
-def fetch_skill(url):
-    url = url.strip()
-    m = re.match(r"^https://github\.com/([^/]+)/([^/]+)/(?:blob|tree)/([^/]+)/(.+)$", url)
-    if m:
-        path = m.group(4).rstrip("/")
-        if not path.lower().endswith(".md"):
-            path += "/SKILL.md"
-        url = "https://raw.githubusercontent.com/%s/%s/%s/%s" % (m.group(1), m.group(2), m.group(3), path)
-    if not re.match(r"^https://[^\s]+$", url):
-        fail("Paste an https:// link to a SKILL.md file.")
+def download(url, limit, accept=None):
     import urllib.error
     import urllib.request
+    headers = {"User-Agent": UA}
+    if accept:
+        headers["Accept"] = accept
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30) as resp:
-            raw = resp.read(300_001)
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as resp:
+            raw = resp.read(limit + 1)
     except urllib.error.HTTPError as e:
-        fail("Couldn't download the skill (HTTP %s)." % e.code)
+        raise RuntimeError("HTTP %s" % e.code)
     except (urllib.error.URLError, OSError) as e:
-        fail("Couldn't download the skill (%s)." % getattr(e, "reason", e))
-    if len(raw) > 300_000:
-        fail("That file is too big for a skill.")
-    return raw.decode("utf-8", "replace"), url
+        raise RuntimeError(str(getattr(e, "reason", e)))
+    if len(raw) > limit:
+        raise RuntimeError("too big")
+    return raw
+
+
+def github_folder(owner, repo, ref, path):
+    """All files of a GitHub folder (through the API), as {relative path: bytes}. None when it can't be listed."""
+    files, total, todo = {}, 0, [""]
+    while todo:
+        sub = todo.pop()
+        api = "https://api.github.com/repos/%s/%s/contents/%s?ref=%s" % (owner, repo, "/".join(x for x in (path, sub) if x), ref)
+        try:
+            items = json.loads(download(api, 2_000_000, "application/vnd.github+json"))
+        except (RuntimeError, ValueError):
+            return None
+        if not isinstance(items, list):
+            return None
+        for item in items:
+            name = str(item.get("name") or "")
+            rel = sub + "/" + name if sub else name
+            if not name or name.startswith(".") or "/" in name or name == "..":
+                continue
+            if item.get("type") == "dir":
+                todo.append(rel)
+            elif item.get("type") == "file" and item.get("download_url"):
+                if len(files) >= 80:
+                    raise RuntimeError("That skill has too many files.")
+                data = download(item["download_url"], 3_000_000)
+                total += len(data)
+                if total > 5_000_000:
+                    raise RuntimeError("That skill is too big.")
+                files[rel] = data
+    return files
+
+
+def fetch_skill(url):
+    """(SKILL.md text, the link it came from, {other relative path: bytes})."""
+    url = url.strip()
+    m = re.match(r"^https://github\.com/([^/]+)/([^/]+)/(?:blob|tree)/([^/]+)/(.+?)/?$", url)
+    if m:
+        owner, repo, ref, path = m.groups()
+        folder = path[:-len("/SKILL.md")] if path.endswith("/SKILL.md") else None if path.lower().endswith(".md") else path
+        if folder is not None:
+            try:
+                files = github_folder(owner, repo, ref, folder)
+            except RuntimeError as e:
+                fail(str(e))
+            if files and "SKILL.md" in files:
+                main = files.pop("SKILL.md")
+                return main.decode("utf-8", "replace"), url + "/SKILL.md", files
+            path = folder + "/SKILL.md"
+        url = "https://raw.githubusercontent.com/%s/%s/%s/%s" % (owner, repo, ref, path)
+    if not re.match(r"^https://[^\s]+$", url):
+        fail("Paste an https:// link to a SKILL.md file.")
+    try:
+        raw = download(url, 300_000)
+    except RuntimeError as e:
+        fail("That file is too big for a skill." if str(e) == "too big" else "Couldn't download the skill (%s)." % e)
+    return raw.decode("utf-8", "replace"), url, {}
 
 
 def cmd_skill_add():
-    """{"name","description","body"} or {"content": whole SKILL.md} or {"url": link to a SKILL.md}; optional "id"."""
+    """{"name","description","body"} or {"content": whole SKILL.md} or {"url": link to a SKILL.md or a GitHub skill folder};
+    optional "id", and "fallback_id" (used when the file names no skill)."""
     spec = spec_from_env()
-    source = None
+    source, extra = None, {}
     if spec.get("url"):
-        content, source = fetch_skill(str(spec["url"]))
+        content, source, extra = fetch_skill(str(spec["url"]))
     else:
         content = str(spec.get("content") or "")
     if content.strip():
@@ -1023,7 +1074,10 @@ def cmd_skill_add():
             fail("A skill file starts with a --- header that has a name and a description.")
         name = str(data.get("name") or "").strip()
         description = str(data.get("description") or "").strip()
-        guess = name or (source.rstrip("/").split("/")[-2] if source and source.endswith("SKILL.md") else "")
+        guess = name or (source.rstrip("/").split("/")[-2] if source and source.endswith("SKILL.md") else "") \
+            or str(spec.get("fallback_id") or "")
+        if guess.upper() == "SKILL":
+            guess = ""
     else:
         name = str(spec.get("name") or "").strip()
         description = str(spec.get("description") or "").strip()
@@ -1035,16 +1089,29 @@ def cmd_skill_add():
         fail("Add a short description: it tells the AI when to use the skill.")
     sid = skill_slug(spec.get("id") or guess)
     if not SKILL_ID.match(sid or ""):
-        fail("Give the skill a name with letters or numbers.")
+        fail("Give the skill a name with letters or numbers (the file has no name: field).")
     description = " ".join(description.split())[:1000]
     text = "---\nname: %s\ndescription: %s\n---\n\n%s\n" % (sid, json.dumps(description, ensure_ascii=False), body.strip())
     folder = os.path.join(SKILLS_DIR, sid)
-    os.makedirs(folder, exist_ok=True)
-    tmp = os.path.join(folder, "SKILL.md.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, os.path.join(folder, "SKILL.md"))
-    out({"id": sid, "name": name or sid, "saved": True})
+    tmp_dir = folder + ".new"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(tmp_dir)
+    try:
+        for rel, data in extra.items():
+            target = os.path.normpath(os.path.join(tmp_dir, rel))
+            if not target.startswith(tmp_dir + os.sep):
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(data)
+        with open(os.path.join(tmp_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(text)
+        shutil.rmtree(folder, ignore_errors=True)
+        os.replace(tmp_dir, folder)
+    except OSError as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        fail("Couldn't save the skill: %s" % e)
+    out({"id": sid, "name": name or sid, "files": len(extra) + 1, "saved": True})
     return 0
 
 
