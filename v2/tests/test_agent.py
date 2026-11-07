@@ -248,6 +248,19 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(mcp["tools"]["target"], "definitely-missing-mcp --flag a b")
         self.assertEqual({s["id"]: s["description"] for s in ex["skills"]},
                          {"tap-counter-style": "Use for counter apps.", "pasted-one": "Pasted: works", "my-file": "From a file"})
+        shown = json.loads(self.agent("skill-show", "tap-counter-style", check=True).stdout)
+        self.assertIn("Always say BUNNY-SKILL.", shown["content"])
+        self.assertEqual(shown["files"], [])
+        other = os.path.join(self.home, ".agents", "skills", "outside-one")
+        os.makedirs(other)
+        with open(os.path.join(other, "SKILL.md"), "w") as f:
+            f.write("---\nname: outside-one\ndescription: From npx skills\n---\nx")
+        ex2 = {s["id"]: s for s in json.loads(self.agent("extras", check=True).stdout)["skills"]}
+        self.assertEqual(ex2["outside-one"]["source"], "agents")
+        self.agent("skill-remove", "outside-one", check=True)
+        self.assertFalse(os.path.exists(other))
+        self.assertNotEqual(self.agent("skill-show", "../etc").returncode, 0)
+        self.assertTrue(mcp["docs"]["oauth"] is False and mcp["tools"]["oauth"] is False)
         cfg_file = os.path.join(self.home, ".config", "opencode", "opencode.json")
         self.assertEqual(os.stat(cfg_file).st_mode & 0o777, 0o600)
         # OpenCode accepts the config (a broken MCP server doesn't stop the chat) and sees the skills.

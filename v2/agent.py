@@ -17,6 +17,7 @@ Lives at ~/.pocketbunty/agent.py. The app runs it through the bridge (server.py)
   agent.py mcp-remove|mcp-enable|mcp-disable <name>
   agent.py skill-add           adds a skill (JSON in $TC_PROMPT: name/description/body, content or url)
   agent.py skill-remove <id>
+  agent.py skill-show <id>     a skill's SKILL.md and its other files
   agent.py version
 
 `run` reads: TC_PROMPT (message), TC_SESSION (OpenCode session to continue, may be empty),
@@ -59,6 +60,9 @@ AUTH_FILE = os.path.join(DATA, "auth.json")
 CONFIG_FILE = os.path.join(CONFIG, "opencode.json")
 RULES_FILE = os.path.join(DIR, "rules.md")
 SKILLS_DIR = os.path.join(CONFIG, "skills")
+# Where OpenCode also finds skills (other tools, `npx skills add`): listed, and removable, too.
+SKILL_SOURCES = [("opencode", SKILLS_DIR), ("agents", os.path.join(HOME, ".agents", "skills")),
+                 ("claude", os.path.join(HOME, ".claude", "skills"))]
 LOGIN_FILE = os.path.join(DIR, "login.json")
 DEFAULT_MODEL = "opencode/deepseek-v4.1-flash-free"
 PROVIDER_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -901,6 +905,48 @@ def skill_slug(text):
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", str(text).lower())).strip("-")[:64].strip("-")
 
 
+def skill_files(root):
+    """(id, SKILL.md path) of the skill folders directly in [root]."""
+    if not os.path.isdir(root):
+        return []
+    found = []
+    for sid in sorted(os.listdir(root)):
+        path = os.path.join(root, sid, "SKILL.md")
+        if not sid.startswith(".") and os.path.isfile(path):
+            found.append((sid, path))
+    return found
+
+
+def find_skill(sid):
+    """The folder of installed skill [sid] (first source wins, like the list), else None."""
+    if not sid or sid.startswith(".") or "/" in sid or "\\" in sid:
+        return None
+    for _, root in SKILL_SOURCES:
+        folder = os.path.join(root, sid)
+        if os.path.isfile(os.path.join(folder, "SKILL.md")):
+            return folder
+    return None
+
+
+def cmd_skill_show(sid):
+    folder = find_skill(sid)
+    if not folder:
+        fail("No skill called %s." % sid)
+    with open(os.path.join(folder, "SKILL.md"), encoding="utf-8", errors="replace") as f:
+        text = f.read(400_000)
+    files = []
+    for base, dirs, names in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for n in sorted(names):
+            rel = os.path.relpath(os.path.join(base, n), folder)
+            if rel != "SKILL.md" and not n.startswith("."):
+                files.append(rel)
+            if len(files) >= 200:
+                break
+    out({"id": sid, "path": os.path.join(folder, "SKILL.md"), "content": text, "files": files})
+    return 0
+
+
 def cmd_extras():
     cfg = read_json(CONFIG_FILE, {})
     servers = []
@@ -909,21 +955,25 @@ def cmd_extras():
             continue
         kind = entry.get("type") or ""
         target = entry.get("url") if kind == "remote" else " ".join(entry.get("command") or [])
+        headers = string_map(entry.get("headers"))
         servers.append({"name": name, "type": kind, "target": str(target or ""), "enabled": entry.get("enabled", True) is not False,
-                        "headers": sorted(string_map(entry.get("headers"))), "env": sorted(string_map(entry.get("environment")))})
-    skills = []
-    if os.path.isdir(SKILLS_DIR):
-        for sid in sorted(os.listdir(SKILLS_DIR)):
-            path = os.path.join(SKILLS_DIR, sid, "SKILL.md")
-            if sid.startswith(".") or not os.path.isfile(path):
+                        "headers": sorted(headers), "env": sorted(string_map(entry.get("environment"))),
+                        "oauth": kind == "remote" and not headers and entry.get("oauth") is not False})
+    skills, seen = [], set()
+    for source, root in SKILL_SOURCES:
+        for sid, path in skill_files(root):
+            if sid in seen:
                 continue
+            seen.add(sid)
             try:
                 with open(path, encoding="utf-8", errors="replace") as f:
                     data, _ = frontmatter(f.read(20000))
             except OSError:
                 continue
             data = data or {}
-            skills.append({"id": sid, "name": str(data.get("name") or sid), "description": str(data.get("description") or "")})
+            skills.append({"id": sid, "name": str(data.get("name") or sid), "description": str(data.get("description") or ""),
+                           "source": source})
+    skills.sort(key=lambda x: x["id"])
     out({"mcp": servers, "skills": skills, "skills_dir": SKILLS_DIR})
     return 0
 
@@ -1116,10 +1166,8 @@ def cmd_skill_add():
 
 
 def cmd_skill_remove(sid):
-    if not SKILL_ID.match(sid):
-        fail("Bad skill name")
-    folder = os.path.join(SKILLS_DIR, sid)
-    if not os.path.isfile(os.path.join(folder, "SKILL.md")):
+    folder = find_skill(sid)
+    if not folder:
         fail("No skill called %s." % sid)
     shutil.rmtree(folder)
     out({"id": sid, "removed": True})
@@ -1418,6 +1466,8 @@ def main():
         return cmd_skill_add()
     if cmd in ("mcp-remove", "mcp-enable", "mcp-disable") and len(rest) == 1:
         return cmd_mcp_set(rest[0], cmd[4:])
+    if cmd == "skill-show" and len(rest) == 1:
+        return cmd_skill_show(rest[0])
     if cmd == "skill-remove" and len(rest) == 1:
         return cmd_skill_remove(rest[0])
     if cmd in ("models", "set-key", "logout", "login-start", "login-finish") and len(rest) == 1:
