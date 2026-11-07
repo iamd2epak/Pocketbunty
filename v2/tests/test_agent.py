@@ -130,8 +130,9 @@ class FakeAntigravity(BaseHTTPRequestHandler):
         if self.path == "/v1internal:fetchAvailableModels":
             return self.reply({"models": {"gemini-3-flash": {"displayName": "Gemini 3 Flash", "maxTokens": 1048576},
                                           "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6", "supportsThinking": False},
+                                          "gpt-oss-120b-medium": {"displayName": "GPT-OSS 120B"},
                                           "chat_20706": {}, "old-model": {"disabled": True}},
-                               "agentModelSorts": [{"groups": [{"modelIds": ["gemini-3-flash", "claude-sonnet-4-6", "old-model"]}]}]})
+                               "agentModelSorts": [{"groups": [{"modelIds": ["gemini-3-flash", "claude-sonnet-4-6", "gpt-oss-120b-medium", "old-model"]}]}]})
         if self.path == "/v1internal:streamGenerateContent?alt=sse":
             body = json.loads(raw)
             contents = body["request"]["contents"]
@@ -390,7 +391,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(auth["antigravity"]["refresh"], "1//refresh|proj-123")
         self.assertTrue(os.path.exists(os.path.join(self.home, ".config", "opencode", "plugin", "pocketbunty-antigravity.js")))
         models = json.loads(self.agent("models", "antigravity", check=True).stdout)["models"]
-        self.assertEqual(sorted(models), ["claude-sonnet-4-6", "gemini-3-flash"])
+        self.assertEqual(sorted(models), ["claude-sonnet-4-6", "gemini-3-flash", "gpt-oss-120b-medium"])
         FakeAntigravity.seen.clear()
         for model in ("gemini-3-flash", "claude-sonnet-4-6"):
             r, events = self.run_chat("say hi", model="antigravity/" + model)
@@ -406,11 +407,32 @@ class AgentTest(unittest.TestCase):
         auth["antigravity"].update(access="ya29.old", expires=0)
         with open(os.path.join(self.home, ".local", "share", "opencode", "auth.json"), "w") as f:
             json.dump(auth, f)
-        r, events = self.run_chat("make ag.txt", model="antigravity/claude-sonnet-4-6")
-        self.assertTrue(os.path.exists(os.path.join(self.project, "ag.txt")), r.stdout + r.stderr)
-        replay = [json.loads(b) for p, h, b in FakeAntigravity.seen if p.startswith("/v1internal:stream") and "functionResponse" in b]
-        calls = [p for c in replay[0]["request"]["contents"] for p in c["parts"] if "functionCall" in p]
-        self.assertEqual(calls[0]["thoughtSignature"], "skip_thought_signature_validator")
+        for model in ("gemini-3-flash", "claude-sonnet-4-6", "gpt-oss-120b-medium"):
+            FakeAntigravity.seen.clear()
+            target = os.path.join(self.project, "ag.txt")
+            if os.path.exists(target):
+                os.remove(target)
+            r, events = self.run_chat("make ag.txt", model="antigravity/" + model)
+            self.assertTrue(os.path.exists(target), model + ": " + r.stdout + r.stderr)
+            replay = [json.loads(b) for p, h, b in FakeAntigravity.seen if p.startswith("/v1internal:stream") and "functionResponse" in b]
+            parts = [p for c in replay[0]["request"]["contents"] for p in c["parts"]]
+            call = next(p for p in parts if "functionCall" in p)
+            result = next(p for p in parts if "functionResponse" in p)
+            self.assertEqual(call["thoughtSignature"], "skip_thought_signature_validator")
+            if model.startswith("gemini"):
+                self.assertNotIn("id", call["functionCall"])
+            else:
+                # Claude and GPT need matching ids on the call and its result.
+                self.assertTrue(call["functionCall"]["id"])
+                self.assertEqual(result["functionResponse"]["id"], call["functionCall"]["id"])
+                try:
+                    import jsonschema
+                except ImportError:
+                    jsonschema = None
+                for decl in replay[0]["request"]["tools"][0]["functionDeclarations"]:
+                    if jsonschema:
+                        jsonschema.Draft202012Validator.check_schema(decl["parameters"])
+                    self.assertEqual(decl["parameters"]["type"], "object")
         claude = [b for h, b in sent if b["model"] == "claude-sonnet-4-6" and b["request"].get("tools")]
         self.assertTrue(claude)
         self.assertEqual(claude[0]["request"]["toolConfig"]["functionCallingConfig"]["mode"], "VALIDATED")

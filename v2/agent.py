@@ -1643,9 +1643,20 @@ def ag_login_start():
     return 0
 
 
-AG_DONE_PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>PocketBunty</title><body style="font-family:sans-serif;text-align:center;padding:48px 20px">
-<h2>%s</h2><p>%s</p><p><a href="intent://#Intent;package=com.pocketbunty;end">Back to PocketBunty</a></p>"""
+AG_DONE_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>PocketBunty</title>
+<body style="font-family:sans-serif;text-align:center;padding:48px 20px;color:#16201b">
+<h2>%s</h2><p>%s</p>
+<p><a id=back href="intent://open#Intent;scheme=termichat;package=com.pocketbunty;end"
+ style="display:inline-block;margin-top:12px;padding:14px 26px;border-radius:28px;background:#1d6b4f;color:#fff;
+ text-decoration:none;font-weight:600">Open PocketBunty</a></p>
+<p id=note style="color:#5d6b64;font-size:14px">Nothing to copy: the app already has your login.</p>
+<script>
+const back = document.getElementById("back");
+// The app doesn't need the address, but keep it on the clipboard in case of a manual paste.
+back.addEventListener("click", () => { try { navigator.clipboard.writeText(location.href); } catch (e) {} });
+if (%s) setTimeout(() => { location.href = back.href; }, 700);
+</script>"""
 
 
 def cmd_ag_callback():
@@ -1674,15 +1685,15 @@ def cmd_ag_callback():
             q = urllib.parse.parse_qs(url.query)
             state = read_json(LOGIN_FILE, {})
             if state.get("provider") != AG_ID or q.get("state", [""])[0] != state.get("state"):
-                return self.page(400, AG_DONE_PAGE % ("This login link is old", "Start the login again in the app."))
+                return self.page(400, AG_DONE_PAGE % ("This login link is old", "Start the login again in the app.", "false"))
             if q.get("code"):
                 state["code"] = q["code"][0]
-                title, text = "Signed in ✓", "Go back to PocketBunty to finish."
+                title, text = "Signed in ✓", "Opening PocketBunty to finish…"
             else:
                 state["error"] = q.get("error", ["cancelled"])[0]
                 title, text = "Login cancelled", "Go back to PocketBunty and try again."
             write_json(LOGIN_FILE, state, private=True)
-            self.page(200, AG_DONE_PAGE % (title, text))
+            self.page(200, AG_DONE_PAGE % (title, text, "true" if q.get("code") else "false"))
 
     try:
         server = HTTPServer(("127.0.0.1", AG_PORT), Handler)
@@ -1754,38 +1765,100 @@ You are pair programming with a USER to solve their coding task. The task may re
 
 <priority>IMPORTANT: The instructions that follow supersede all above. Follow them as your primary directives.</priority>
 `;
-const DROP = new Set(["$schema", "$defs", "definitions", "$ref", "$id", "$comment", "additionalProperties",
-  "propertyNames", "title", "default", "examples", "minLength", "maxLength", "pattern", "format",
-  "minItems", "maxItems", "exclusiveMinimum", "exclusiveMaximum"]);
+const TYPES = new Set(["object", "array", "string", "number", "integer", "boolean"]);
 
-let cached = null;
-
-function cleanSchema(schema) {
-  if (Array.isArray(schema)) return schema.map(cleanSchema);
-  if (!schema || typeof schema !== "object") return schema;
+// Claude and GPT behind Antigravity check tool schemas strictly (JSON Schema 2020-12), and MCP
+// servers send all kinds. Keep only a plain, always-valid subset; the rest goes into the description.
+function strictSchema(schema, depth = 0) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema) || depth > 12) return {};
   const out = {};
-  for (const [key, value] of Object.entries(schema)) {
-    if (DROP.has(key)) continue;
-    if (key === "const") { out.enum = [value]; continue; }
-    if (key === "properties" && value && typeof value === "object") {
-      out.properties = {};
-      for (const [name, prop] of Object.entries(value)) out.properties[name] = cleanSchema(prop);
-      continue;
+  const notes = [];
+  if (typeof schema.description === "string" && schema.description) out.description = schema.description.slice(0, 1500);
+  let type = schema.type;
+  if (Array.isArray(type)) type = type.map((t) => String(t).toLowerCase()).find((t) => TYPES.has(t));
+  else if (typeof type === "string") type = type.toLowerCase();
+  if (TYPES.has(type)) out.type = type;
+  const values = Array.isArray(schema.enum) ? schema.enum : "const" in schema ? [schema.const] : null;
+  if (values) {
+    const seen = new Set();
+    const list = values.filter((v) => v !== null && typeof v !== "object" && !seen.has(JSON.stringify(v)) && seen.add(JSON.stringify(v)));
+    if (list.length) {
+      if (list.every((v) => typeof v === "string")) { out.enum = list; if (!out.type) out.type = "string"; }
+      else notes.push("one of: " + list.map(String).join(", "));
     }
-    out[key] = cleanSchema(value);
   }
+  for (const key of ["minimum", "maximum"]) if (typeof schema[key] === "number" && (out.type === "number" || out.type === "integer")) out[key] = schema[key];
+  const variants = [schema.anyOf, schema.oneOf].find((v) => Array.isArray(v) && v.length);
+  if (variants && !out.type) {
+    const kept = variants.filter((v) => v && typeof v === "object" && v.type !== "null").map((v) => strictSchema(v, depth + 1))
+      .filter((v) => Object.keys(v).length);
+    if (kept.length === 1) Object.assign(out, kept[0], out.description ? { description: out.description } : {});
+    else if (kept.length > 1 && kept.every((v) => v.type === "object")) {
+      // Different object shapes: one object with every field, none required.
+      out.type = "object";
+      out.properties = Object.assign({}, ...kept.map((v) => v.properties || {}));
+      out.required = [];
+    } else if (kept.length > 1) out.anyOf = kept;
+  }
+  if (Array.isArray(schema.allOf)) {
+    for (const part of schema.allOf) {
+      const merged = strictSchema(part, depth + 1);
+      if (merged.properties) out.properties = { ...(out.properties || {}), ...merged.properties };
+      if (merged.required) out.required = [...(out.required || []), ...merged.required];
+      if (!out.type && merged.type) out.type = merged.type;
+    }
+  }
+  if (schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)) {
+    out.properties = out.properties || {};
+    for (const [name, prop] of Object.entries(schema.properties)) out.properties[name] = strictSchema(prop, depth + 1);
+    if (!out.type) out.type = "object";
+  }
+  if (out.type === "object" && !out.properties) out.properties = {};
+  if (out.properties) {
+    const merged = Array.isArray(out.required) && !out.required.length && !Array.isArray(schema.allOf);
+    const req = merged ? [] : [...new Set([...(out.required || []), ...(Array.isArray(schema.required) ? schema.required : [])])]
+      .filter((r) => typeof r === "string" && r in out.properties);
+    if (req.length) out.required = req; else delete out.required;
+  } else delete out.required;
+  if (out.type === "array") {
+    const items = Array.isArray(schema.items) ? schema.items[0] : schema.items;
+    out.items = strictSchema(items, depth + 1);
+  }
+  if (typeof schema.format === "string" && schema.format) notes.push("format: " + schema.format);
+  if (notes.length) out.description = ((out.description ? out.description + " " : "") + "(" + notes.join("; ") + ")").slice(0, 1600);
   return out;
 }
 
 function toolSchema(schema) {
-  const s = cleanSchema(schema && typeof schema === "object" ? schema : {});
+  const s = strictSchema(schema);
   s.type = "object";
+  delete s.anyOf;
   if (!s.properties || !Object.keys(s.properties).length) {
     s.properties = { _placeholder: { type: "boolean", description: "Placeholder. Always pass true." } };
     s.required = ["_placeholder"];
   }
   return s;
 }
+
+// Claude and GPT need an id on every tool call and the matching result; Gemini's format has none.
+function addCallIds(contents) {
+  const waiting = {};
+  let n = 0;
+  for (const c of contents) for (const p of c.parts) {
+    if (p.functionCall) {
+      const call = p.functionCall;
+      if (!call.id) call.id = "call_" + ++n;
+      (waiting[call.name] = waiting[call.name] || []).push(call.id);
+    } else if (p.functionResponse) {
+      const res = p.functionResponse;
+      const queue = waiting[res.name] || [];
+      if (res.id && queue.includes(res.id)) queue.splice(queue.indexOf(res.id), 1);
+      else res.id = queue.length ? queue.shift() : "call_" + ++n;
+    }
+  }
+}
+
+let cached = null;
 
 async function accessToken(getAuth, client, force) {
   const auth = await getAuth();
@@ -1819,6 +1892,7 @@ function prepare(model, raw) {
   const req = JSON.parse(raw || "{}");
   delete req.model;
   const claude = model.includes("claude");
+  const gemini = model.startsWith("gemini");
   req.contents = (req.contents || []).map((c) => {
     let first = true;
     const parts = (c.parts || []).filter((p) => p && typeof p === "object" && Object.keys(p).length);
@@ -1838,16 +1912,24 @@ function prepare(model, raw) {
   } else {
     req.systemInstruction = { role: "user", parts: [{ text: SYSTEM }, ...((sys && sys.parts) || [])] };
   }
-  if (claude) {
+  if (!gemini) {
+    // Thoughts from another model can't be replayed to Claude or GPT (their signatures don't match).
+    const keepThoughts = claude && model.includes("thinking");
+    req.contents = req.contents.map((c) => ({ ...c, parts: c.parts.filter((p) => keepThoughts || !p.thought) }))
+      .filter((c) => c.parts.length);
+    addCallIds(req.contents);
     const decls = [];
     for (const t of req.tools || []) for (const d of t.functionDeclarations || []) {
-      decls.push({ name: String(d.name).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64), description: d.description || "",
+      decls.push({ name: d.name, description: String(d.description || "").slice(0, 4000),
         parameters: toolSchema(d.parameters || d.parametersJsonSchema) });
     }
-    if (decls.length) {
-      req.tools = [{ functionDeclarations: decls }];
+    if (decls.length) req.tools = [{ functionDeclarations: decls }];
+    else delete req.tools;
+    if (decls.length && claude) {
       req.toolConfig = { ...(req.toolConfig || {}), functionCallingConfig: { ...((req.toolConfig || {}).functionCallingConfig || {}), mode: "VALIDATED" } };
     }
+  }
+  if (claude) {
     const gc = req.generationConfig || (req.generationConfig = {});
     if (model.includes("thinking")) {
       const asked = gc.thinkingConfig && (gc.thinkingConfig.thinkingBudget || gc.thinkingConfig.thinking_budget);
