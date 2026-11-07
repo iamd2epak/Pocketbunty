@@ -12,6 +12,11 @@ Lives at ~/.pocketbunty/agent.py. The app runs it through the bridge (server.py)
   agent.py login-start <p>     starts a browser login: prints the page to open
   agent.py login-finish <p>    finishes it (code in $TC_PROMPT, or waits for the approval)
   agent.py dns                 makes OpenCode's name lookups work on this phone (also done before every run)
+  agent.py extras              MCP servers and skills OpenCode uses (JSON)
+  agent.py mcp-add             adds or replaces an MCP server (JSON in $TC_PROMPT)
+  agent.py mcp-remove|mcp-enable|mcp-disable <name>
+  agent.py skill-add           adds a skill (JSON in $TC_PROMPT: name/description/body, content or url)
+  agent.py skill-remove <id>
   agent.py version
 
 `run` reads: TC_PROMPT (message), TC_SESSION (OpenCode session to continue, may be empty),
@@ -34,6 +39,7 @@ import os
 import queue
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -42,7 +48,7 @@ import sys
 import threading
 import time
 
-VERSION = 1
+VERSION = 2
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, ".pocketbunty")
 OC_DIR = os.path.join(DIR, "opencode")
@@ -52,9 +58,12 @@ CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".ca
 AUTH_FILE = os.path.join(DATA, "auth.json")
 CONFIG_FILE = os.path.join(CONFIG, "opencode.json")
 RULES_FILE = os.path.join(DIR, "rules.md")
+SKILLS_DIR = os.path.join(CONFIG, "skills")
 LOGIN_FILE = os.path.join(DIR, "login.json")
 DEFAULT_MODEL = "opencode/deepseek-v4.1-flash-free"
 PROVIDER_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+MCP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
+SKILL_ID = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,200}$")
 
 # Providers shown in the app even before they are connected, in this order (OpenCode knows 200+).
@@ -100,7 +109,7 @@ def read_json(path, default):
 def write_json(path, data, private=False):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private or path == CONFIG_FILE else 0o644)
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
@@ -846,6 +855,210 @@ def cmd_add_provider():
     return 0
 
 
+# ---------------------------------------------------------------- MCP servers and skills
+
+def spec_from_env():
+    try:
+        spec = json.loads(os.environ.get("TC_PROMPT", ""))
+    except ValueError:
+        fail("Bad details.")
+    if not isinstance(spec, dict):
+        fail("Bad details.")
+    return spec
+
+
+def mcp_servers(cfg):
+    mcp = cfg.get("mcp")
+    return mcp if isinstance(mcp, dict) else {}
+
+
+def string_map(value):
+    if not isinstance(value, dict):
+        return {}
+    return {str(k).strip(): str(v) for k, v in value.items() if str(k).strip()}
+
+
+def frontmatter(text):
+    """The simple `key: value` lines of a SKILL.md header (enough for name and description)."""
+    m = re.match(r"^﻿?---\s*\n(.*?)\n---\s*(\n|$)", text, re.S)
+    if not m:
+        return None, text
+    data = {}
+    for line in m.group(1).splitlines():
+        kv = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", line)
+        if kv:
+            v = kv.group(2).strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                try:
+                    v = json.loads(v) if v[0] == '"' else v[1:-1]
+                except ValueError:
+                    v = v[1:-1]
+            data[kv.group(1)] = v
+    return data, text[m.end():]
+
+
+def skill_slug(text):
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", str(text).lower())).strip("-")[:64].strip("-")
+
+
+def cmd_extras():
+    cfg = read_json(CONFIG_FILE, {})
+    servers = []
+    for name, entry in sorted(mcp_servers(cfg).items(), key=lambda kv: kv[0].lower()):
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("type") or ""
+        target = entry.get("url") if kind == "remote" else " ".join(entry.get("command") or [])
+        servers.append({"name": name, "type": kind, "target": str(target or ""), "enabled": entry.get("enabled", True) is not False,
+                        "headers": sorted(string_map(entry.get("headers"))), "env": sorted(string_map(entry.get("environment")))})
+    skills = []
+    if os.path.isdir(SKILLS_DIR):
+        for sid in sorted(os.listdir(SKILLS_DIR)):
+            path = os.path.join(SKILLS_DIR, sid, "SKILL.md")
+            if sid.startswith(".") or not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    data, _ = frontmatter(f.read(20000))
+            except OSError:
+                continue
+            data = data or {}
+            skills.append({"id": sid, "name": str(data.get("name") or sid), "description": str(data.get("description") or "")})
+    out({"mcp": servers, "skills": skills, "skills_dir": SKILLS_DIR})
+    return 0
+
+
+def cmd_mcp_add():
+    """{"name","type":"remote"|"local","url","headers":{},"oauth":false,"command":"npx -y pkg","env":{}}"""
+    spec = spec_from_env()
+    name = str(spec.get("name", "")).strip()
+    kind = str(spec.get("type", "")).strip()
+    if not MCP_NAME.match(name):
+        fail("The name can use letters, numbers, - and _ (no spaces).")
+    if kind == "remote":
+        url = str(spec.get("url", "")).strip()
+        if not re.match(r"^https?://[^\s]+$", url):
+            fail("The address must start with https:// (or http://).")
+        entry = {"type": "remote", "url": url, "enabled": True}
+        headers = string_map(spec.get("headers"))
+        if headers:
+            entry["headers"] = headers
+        if headers or spec.get("oauth") is False:
+            entry["oauth"] = False
+    elif kind == "local":
+        command = spec.get("command")
+        try:
+            parts = [str(p) for p in command] if isinstance(command, list) else shlex.split(str(command or ""))
+        except ValueError:
+            fail("The command has an unclosed quote.")
+        if not parts:
+            fail("Type the command that starts the server, like: npx -y some-mcp-server")
+        entry = {"type": "local", "command": parts, "enabled": True}
+        env = string_map(spec.get("env"))
+        if env:
+            entry["environment"] = env
+    else:
+        fail("Pick remote (a web address) or local (a command).")
+    cfg = read_json(CONFIG_FILE, {})
+    cfg.setdefault("$schema", "https://opencode.ai/config.json")
+    servers = mcp_servers(cfg)
+    servers[name] = entry
+    cfg["mcp"] = servers
+    # Headers and env can hold keys: keep the file private.
+    write_json(CONFIG_FILE, cfg, private=True)
+    out({"name": name, "saved": True})
+    return 0
+
+
+def cmd_mcp_set(name, action):
+    cfg = read_json(CONFIG_FILE, {})
+    servers = mcp_servers(cfg)
+    if name not in servers or not isinstance(servers[name], dict):
+        fail("No MCP server called %s." % name)
+    if action == "remove":
+        del servers[name]
+    else:
+        servers[name]["enabled"] = action == "enable"
+    cfg["mcp"] = servers
+    write_json(CONFIG_FILE, cfg, private=True)
+    out({"name": name, action: True})
+    return 0
+
+
+def fetch_skill(url):
+    url = url.strip()
+    m = re.match(r"^https://github\.com/([^/]+)/([^/]+)/(?:blob|tree)/([^/]+)/(.+)$", url)
+    if m:
+        path = m.group(4).rstrip("/")
+        if not path.lower().endswith(".md"):
+            path += "/SKILL.md"
+        url = "https://raw.githubusercontent.com/%s/%s/%s/%s" % (m.group(1), m.group(2), m.group(3), path)
+    if not re.match(r"^https://[^\s]+$", url):
+        fail("Paste an https:// link to a SKILL.md file.")
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=30) as resp:
+            raw = resp.read(300_001)
+    except urllib.error.HTTPError as e:
+        fail("Couldn't download the skill (HTTP %s)." % e.code)
+    except (urllib.error.URLError, OSError) as e:
+        fail("Couldn't download the skill (%s)." % getattr(e, "reason", e))
+    if len(raw) > 300_000:
+        fail("That file is too big for a skill.")
+    return raw.decode("utf-8", "replace"), url
+
+
+def cmd_skill_add():
+    """{"name","description","body"} or {"content": whole SKILL.md} or {"url": link to a SKILL.md}; optional "id"."""
+    spec = spec_from_env()
+    source = None
+    if spec.get("url"):
+        content, source = fetch_skill(str(spec["url"]))
+    else:
+        content = str(spec.get("content") or "")
+    if content.strip():
+        data, body = frontmatter(content)
+        if data is None:
+            fail("A skill file starts with a --- header that has a name and a description.")
+        name = str(data.get("name") or "").strip()
+        description = str(data.get("description") or "").strip()
+        guess = name or (source.rstrip("/").split("/")[-2] if source and source.endswith("SKILL.md") else "")
+    else:
+        name = str(spec.get("name") or "").strip()
+        description = str(spec.get("description") or "").strip()
+        body = str(spec.get("body") or "").strip()
+        guess = name
+        if not body:
+            fail("Write the instructions for the AI.")
+    if not description:
+        fail("Add a short description: it tells the AI when to use the skill.")
+    sid = skill_slug(spec.get("id") or guess)
+    if not SKILL_ID.match(sid or ""):
+        fail("Give the skill a name with letters or numbers.")
+    description = " ".join(description.split())[:1000]
+    text = "---\nname: %s\ndescription: %s\n---\n\n%s\n" % (sid, json.dumps(description, ensure_ascii=False), body.strip())
+    folder = os.path.join(SKILLS_DIR, sid)
+    os.makedirs(folder, exist_ok=True)
+    tmp = os.path.join(folder, "SKILL.md.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, os.path.join(folder, "SKILL.md"))
+    out({"id": sid, "name": name or sid, "saved": True})
+    return 0
+
+
+def cmd_skill_remove(sid):
+    if not SKILL_ID.match(sid):
+        fail("Bad skill name")
+    folder = os.path.join(SKILLS_DIR, sid)
+    if not os.path.isfile(os.path.join(folder, "SKILL.md")):
+        fail("No skill called %s." % sid)
+    shutil.rmtree(folder)
+    out({"id": sid, "removed": True})
+    return 0
+
+
 def login_server():
     """The server kept alive between login-start and login-finish."""
     info = read_json(LOGIN_FILE, {})
@@ -1130,6 +1343,16 @@ def main():
         return 0
     if cmd == "add-provider":
         return cmd_add_provider()
+    if cmd == "extras":
+        return cmd_extras()
+    if cmd == "mcp-add":
+        return cmd_mcp_add()
+    if cmd == "skill-add":
+        return cmd_skill_add()
+    if cmd in ("mcp-remove", "mcp-enable", "mcp-disable") and len(rest) == 1:
+        return cmd_mcp_set(rest[0], cmd[4:])
+    if cmd == "skill-remove" and len(rest) == 1:
+        return cmd_skill_remove(rest[0])
     if cmd in ("models", "set-key", "logout", "login-start", "login-finish") and len(rest) == 1:
         return {"models": cmd_models, "set-key": cmd_set_key, "logout": cmd_logout,
                 "login-start": cmd_login_start, "login-finish": cmd_login_finish}[cmd](rest[0])

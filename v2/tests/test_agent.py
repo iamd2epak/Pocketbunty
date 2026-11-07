@@ -226,6 +226,43 @@ class AgentTest(unittest.TestCase):
         self.assertNotEqual(self.agent("set-key", "deepseek", prompt="bad key").returncode, 0)
         self.assertNotEqual(self.agent("models", "BAD NAME").returncode, 0)
 
+    def test_mcp_servers_and_skills(self):
+        self.agent("mcp-add", prompt=json.dumps({"name": "docs", "type": "remote", "url": "http://127.0.0.1:9/mcp",
+                                                  "headers": {"X-Api-Key": "k1"}}), check=True)
+        self.agent("mcp-add", prompt=json.dumps({"name": "tools", "type": "local", "command": "definitely-missing-mcp --flag 'a b'",
+                                                  "env": {"TOKEN": "t"}}), check=True)
+        self.agent("mcp-disable", "docs", check=True)
+        self.assertNotEqual(self.agent("mcp-add", prompt=json.dumps({"name": "bad name", "type": "local", "command": "x"})).returncode, 0)
+        self.assertNotEqual(self.agent("mcp-add", prompt=json.dumps({"name": "x", "type": "remote", "url": "ftp://x"})).returncode, 0)
+        self.agent("skill-add", prompt=json.dumps({"name": "Tap Counter Style", "description": "Use for counter apps.",
+                                                    "body": "Always say BUNNY-SKILL."}), check=True)
+        self.agent("skill-add", prompt=json.dumps({"content": "---\nname: pasted-one\ndescription: 'Pasted: works'\n---\nBody"}), check=True)
+        self.assertNotEqual(self.agent("skill-add", prompt=json.dumps({"name": "x", "body": "no description"})).returncode, 0)
+        ex = json.loads(self.agent("extras", check=True).stdout)
+        mcp = {m["name"]: m for m in ex["mcp"]}
+        self.assertEqual(mcp["docs"]["enabled"], False)
+        self.assertEqual(mcp["docs"]["headers"], ["X-Api-Key"])
+        self.assertEqual(mcp["tools"]["target"], "definitely-missing-mcp --flag a b")
+        self.assertEqual({s["id"]: s["description"] for s in ex["skills"]},
+                         {"tap-counter-style": "Use for counter apps.", "pasted-one": "Pasted: works"})
+        cfg_file = os.path.join(self.home, ".config", "opencode", "opencode.json")
+        self.assertEqual(os.stat(cfg_file).st_mode & 0o777, 0o600)
+        # OpenCode accepts the config (a broken MCP server doesn't stop the chat) and sees the skills.
+        r, events = self.run_chat("Say hi")
+        self.assertEqual(events[-1]["type"], "done", (events, r.stderr[-500:]))
+        r = subprocess.run([OPENCODE, "debug", "skill"], env=dict(self.env, PB_OPENCODE=OPENCODE), cwd=self.project,
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            self.assertIn("tap-counter-style", r.stdout)
+            self.assertIn("pasted-one", r.stdout)
+        self.agent("mcp-remove", "docs", check=True)
+        self.agent("mcp-remove", "tools", check=True)
+        self.agent("skill-remove", "tap-counter-style", check=True)
+        self.agent("skill-remove", "pasted-one", check=True)
+        ex = json.loads(self.agent("extras", check=True).stdout)
+        self.assertEqual((ex["mcp"], ex["skills"]), ([], []))
+        self.assertNotEqual(self.agent("skill-remove", "../x").returncode, 0)
+
     def test_dns_fix_writes_glibc_files_once(self):
         self.agent("dns", check=True)
         self.agent("dns", check=True)
