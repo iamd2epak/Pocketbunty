@@ -1599,7 +1599,8 @@ def ag_listening():
     try:
         with socket.create_connection(("127.0.0.1", AG_PORT), timeout=1) as c:
             c.sendall(b"GET /pb-ping HTTP/1.0\r\n\r\n")
-            return b"pocketbunty" in c.recv(512)
+            # Ours, and for this home (it reads the same login file).
+            return ("pocketbunty " + LOGIN_FILE).encode() in c.recv(2048)
     except OSError:
         return False
 
@@ -1679,7 +1680,7 @@ def cmd_ag_callback():
         def do_GET(self):
             url = urllib.parse.urlparse(self.path)
             if url.path == "/pb-ping":
-                return self.page(200, "pocketbunty", "text/plain")
+                return self.page(200, "pocketbunty " + LOGIN_FILE, "text/plain")
             if url.path != "/oauth-callback":
                 return self.page(404, "Not found", "text/plain")
             q = urllib.parse.parse_qs(url.query)
