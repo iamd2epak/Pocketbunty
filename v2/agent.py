@@ -74,6 +74,7 @@ MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,200}$")
 POPULAR = [
     ("opencode", "OpenCode Free"), ("opencode-go", "OpenCode Go"), ("openrouter", "OpenRouter"),
     ("anthropic", "Anthropic (Claude API)"), ("openai", "OpenAI / ChatGPT"), ("google", "Google Gemini"),
+    ("antigravity", "Google Antigravity (experimental)"),
     ("deepseek", "DeepSeek"), ("zai-coding-plan", "Z.AI Coding Plan (GLM)"), ("zai", "Z.AI (GLM)"),
     ("moonshotai", "Moonshot (Kimi)"), ("kimi-code-plan-global", "Kimi Code Plan"), ("mistral", "Mistral"),
     ("github-copilot", "GitHub Copilot"), ("xai", "xAI (Grok)"), ("groq", "Groq"),
@@ -82,7 +83,7 @@ POPULAR = [
     ("nvidia", "NVIDIA"), ("huggingface", "Hugging Face"), ("chutes", "Chutes"), ("ollama-cloud", "Ollama Cloud"),
 ]
 # Providers with a browser/device login (OpenCode's OAuth): only that, or that or an API key.
-OAUTH_ONLY = {"github-copilot"}
+OAUTH_ONLY = {"github-copilot", "antigravity"}
 OAUTH_OR_KEY = {"openai", "gitlab", "poe"}
 
 
@@ -155,6 +156,7 @@ DNS_HOSTS = [
     "api.kimi.com", "api.mistral.ai", "api.x.ai", "api.groq.com", "api.together.xyz", "api.fireworks.ai",
     "api.deepinfra.com", "api.cerebras.ai", "integrate.api.nvidia.com", "router.huggingface.co",
     "api.minimax.io", "dashscope-intl.aliyuncs.com", "llm.chutes.ai", "ollama.com", "registry.npmjs.org",
+    "daily-cloudcode-pa.googleapis.com", "oauth2.googleapis.com",
 ]
 PUBLIC_DNS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1", "8.8.4.4", "208.67.222.222"]
 HOSTS_START = "# pocketbunty-dns start (written by PocketBunty for OpenCode; refreshed on every run)"
@@ -457,6 +459,11 @@ def cmd_run():
         out({"type": "error", "message": "Pick a model first (Model button)."})
         return 1
     provider, model_id = model.split("/", 1)
+    if provider == AG_ID and isinstance(read_json(AUTH_FILE, {}).get(AG_ID), dict):
+        try:
+            ag_install()  # keeps the plugin current after an update of this file
+        except RuntimeError:
+            pass
     if access not in ACCESS:
         access = "edit"
 
@@ -743,7 +750,7 @@ def cmd_status():
             "name": name,
             "status": "available" if info else "not configured",
             "method": ("browser login" if info and info.get("type") == "oauth" else "API key") if info else "",
-            "auth_kind": "Custom" if pid in custom else kind,
+            "auth_kind": "Custom" if pid in custom and pid not in OAUTH_ONLY else kind,
         })
 
     for pid, name in POPULAR:
@@ -761,6 +768,8 @@ def cmd_models(provider):
     binary = opencode_bin()
     if binary is None:
         fail("OpenCode isn't installed. Run the PocketBunty setup again.", 127)
+    if provider == AG_ID:
+        ag_refresh_models()
     try:
         fix_dns()
         r = subprocess.run([binary, "models", provider], env=oc_env(), cwd=HOME, capture_output=True, text=True, timeout=120)
@@ -819,6 +828,8 @@ def cmd_logout(provider):
         del cfg["provider"][provider]
         write_json(CONFIG_FILE, cfg)
         removed.append("custom provider")
+    if provider == AG_ID:
+        ag_uninstall()
     out({"provider": provider, "removed": removed})
     return 0
 
@@ -1242,15 +1253,15 @@ def end_login():
 OPENAI_ISSUER = "https://auth.openai.com"
 OPENAI_CLIENT = "app_EMoamEEZ73f0CkXaXp7hrann"
 COPILOT_CLIENT = "Ov23li8tweQw6odWQebz"
-NATIVE_LOGINS = {"openai", "github-copilot"}
+NATIVE_LOGINS = {"openai", "github-copilot", "antigravity"}
 UA = "opencode/1.19.5"
 
 
-def web(method, url, data=None, form=False, timeout=30):
+def web(method, url, data=None, form=False, timeout=30, headers=None):
     """(status, parsed JSON or text). Network failures raise RuntimeError with a readable reason."""
     import urllib.error
     import urllib.request
-    headers = {"User-Agent": UA, "Accept": "application/json"}
+    headers = dict({"User-Agent": UA, "Accept": "application/json"}, **(headers or {}))
     body = None
     if data is not None:
         if form:
@@ -1301,6 +1312,8 @@ def save_oauth(provider, info):
 
 
 def native_login_start(provider):
+    if provider == AG_ID:
+        return ag_login_start()
     if provider == "openai":
         status, data = web("POST", OPENAI_ISSUER + "/api/accounts/deviceauth/usercode", {"client_id": OPENAI_CLIENT})
         if status != 200 or not isinstance(data, dict) or not data.get("user_code"):
@@ -1325,6 +1338,8 @@ def native_login_start(provider):
 
 def native_login_finish(provider, state):
     """Waits (≤ 280 s) until the user approves the code on the page, then saves the login."""
+    if provider == AG_ID:
+        return ag_login_finish(state)
     end = min(time.time() + 280, state.get("expires", 0))
     interval = state.get("interval", 5)
     while time.time() < end:
@@ -1369,6 +1384,576 @@ def native_login_finish(provider, state):
                 fail("GitHub login failed: %s" % (data.get("error_description") or err or "unknown"))
         time.sleep(interval + 3)
     fail("Login wasn't approved in time. Tap Start again.")
+
+
+# ---- Google Antigravity (experimental) ----
+# Signs in with a Google account the way the Antigravity app does (its public desktop OAuth client),
+# then a small OpenCode plugin written here (AG_PLUGIN_JS) sends the chat requests to Antigravity's
+# Cloud Code server with that login. Not an official Google API for other apps: Google may limit
+# accounts that use it. The app says so before the login.
+
+AG_ID = "antigravity"
+AG_NAME = "Google Antigravity (experimental)"
+AG_SCOPES = ["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/userinfo.email",
+             "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/cclog",
+             "https://www.googleapis.com/auth/experimentsandconfigs"]
+AG_PORT = 51121
+AG_REDIRECT = "http://localhost:%d/oauth-callback" % AG_PORT
+AG_ENDPOINT = os.environ.get("PB_AG_ENDPOINT") or "https://daily-cloudcode-pa.googleapis.com"
+AG_TOKEN_URL = os.environ.get("PB_AG_TOKEN_URL") or "https://oauth2.googleapis.com/token"
+AG_MANIFEST = os.environ.get("PB_AG_MANIFEST") or "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml"
+AG_VERSION_MIN, AG_VERSION_FALLBACK = (2, 23, 0), "2.24.0"
+AG_CHANGELISTS = {"2.23.0": "998057262", "2.23.1": "998881661", "2.24.0": "1000335682"}
+AG_STATE = os.path.join(DIR, "antigravity.json")
+AG_PLUGIN = os.path.join(CONFIG, "plugin", "pocketbunty-antigravity.js")
+# Used when Google's model list can't be read: models Antigravity has served for a long time.
+AG_FALLBACK_MODELS = {
+    "gemini-3-flash": ("Gemini 3 Flash", True, 1048576, 65536),
+    "gemini-3-pro-high": ("Gemini 3 Pro (High)", True, 1048576, 65535),
+    "gemini-3-pro-low": ("Gemini 3 Pro (Low)", True, 1048576, 65535),
+    "claude-sonnet-4-6": ("Claude Sonnet 4.6", False, 200000, 64000),
+    "claude-opus-4-6-thinking": ("Claude Opus 4.6 Thinking", True, 200000, 64000),
+}
+
+
+def ag_client():
+    """(client id, secret): the Antigravity app's public OAuth client. The PocketBunty app brings it
+    (built into the APK, not in this file) at login-start; it's kept in AG_STATE on the phone."""
+    saved = read_json(AG_STATE, {})
+    cid = os.environ.get("PB_AG_CLIENT") or saved.get("client_id") or ""
+    secret = os.environ.get("PB_AG_SECRET") or saved.get("client_secret") or ""
+    if not cid.endswith(".apps.googleusercontent.com") or not secret:
+        raise RuntimeError("This app version can't sign in to Antigravity. Update PocketBunty and try again.")
+    return cid, secret
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def ag_version():
+    """The current Antigravity release (newer models need a recent one), checked once a day."""
+    saved = read_json(AG_STATE, {})
+    if saved.get("version") and time.time() - saved.get("checked", 0) < 86400:
+        return saved["version"]
+    version = saved.get("version") or AG_VERSION_FALLBACK
+    try:
+        status, text = web("GET", AG_MANIFEST, timeout=8, headers={"User-Agent": "electron-builder", "Accept": "*/*"})
+        m = re.search(r"^version:\s*['\"]?(\d{1,6}\.\d{1,6}\.\d{1,6})", text if isinstance(text, str) else "", re.M)
+        if status == 200 and m and tuple(int(x) for x in m.group(1).split(".")) >= AG_VERSION_MIN:
+            version = m.group(1)
+    except RuntimeError:
+        pass
+    saved.update(version=version, checked=time.time())
+    write_json(AG_STATE, saved, private=True)
+    return version
+
+
+def ag_user_agent():
+    version = ag_version()
+    cl = AG_CHANGELISTS.get(version)
+    return "antigravity/hub/%s (aidev_client; os_type=darwin; arch=arm64%s)" % (version, "; cl=" + cl if cl else "")
+
+
+def ag_call(path, access, body, timeout=20, extra=None):
+    headers = {"Authorization": "Bearer " + access, "User-Agent": ag_user_agent()}
+    headers.update(extra or {})
+    return web("POST", AG_ENDPOINT + "/v1internal:" + path, body, timeout=timeout, headers=headers)
+
+
+def ag_project(access):
+    """The account's Cloud Code project (Google makes one on first use). "" when none comes back."""
+    status, data = ag_call("loadCodeAssist", access, {"metadata": {"ideType": "ANTIGRAVITY"}})
+    if status in (401, 403):
+        msg = (data.get("error") or {}).get("message") if isinstance(data, dict) else ""
+        raise RuntimeError("Google didn't allow Antigravity for this account (HTTP %s)%s" % (status, ": " + msg if msg else "."))
+    if status != 200 or not isinstance(data, dict):
+        return ""
+
+    def project_id(v):
+        v = v.get("id") if isinstance(v, dict) else v
+        return v.strip() if isinstance(v, str) else ""
+
+    found = project_id(data.get("cloudaicompanionProject"))
+    if found:
+        return found
+    tiers = data.get("allowedTiers") or []
+    tier = next((t.get("id") for t in tiers if isinstance(t, dict) and t.get("isDefault") and t.get("id")), None) \
+        or (tiers[0].get("id") if tiers and isinstance(tiers[0], dict) else None) \
+        or (data.get("currentTier") or {}).get("id") or "free-tier"
+    body = {"tier_id": tier, "metadata": {"ide_type": "ANTIGRAVITY", "ide_version": ag_version(), "ide_name": "antigravity"}}
+    for _ in range(6):
+        status, op = ag_call("onboardUser", access, body, timeout=30, extra={
+            "User-Agent": ag_user_agent() + " google-api-nodejs-client/10.3.0", "X-Goog-Api-Client": "gl-node/22.21.1"})
+        if status != 200 or not isinstance(op, dict):
+            return ""
+        if op.get("done"):
+            return project_id((op.get("response") or {}).get("cloudaicompanionProject"))
+        time.sleep(4)
+    return ""
+
+
+def ag_model(mid, name, thinking, context, output, images=True):
+    return {"name": name, "reasoning": bool(thinking), "attachment": bool(images), "tool_call": True,
+            "limit": {"context": int(context), "output": int(output)},
+            "modalities": {"input": ["text", "image"] if images else ["text"], "output": ["text"]},
+            "cost": {"input": 0, "output": 0}}
+
+
+def ag_models(access, project):
+    """The chat models this account may use, from Google (falls back to a known list)."""
+    try:
+        status, data = ag_call("fetchAvailableModels", access, {"project": project} if project else {})
+    except RuntimeError:
+        status, data = 0, None
+    found = {}
+    if status == 200 and isinstance(data, dict) and isinstance(data.get("models"), dict):
+        catalog_ = data["models"]
+        visible = [m for s in data.get("agentModelSorts") or [] for g in (s or {}).get("groups") or []
+                   for m in (g or {}).get("modelIds") or []]
+        ids = visible or [m for m in catalog_ if not m.startswith(("chat_", "tab_"))]
+        for mid in ids:
+            entry = catalog_.get(mid) if isinstance(catalog_.get(mid), dict) else {}
+            if entry.get("disabled") or not MODEL_ID.match(mid) or "image" in mid or "/" in mid:
+                continue
+            thinking = entry.get("supportsThinking")
+            if thinking is None:
+                thinking = "thinking" in mid or mid.startswith("gemini-3")
+            context = entry.get("maxTokens") or (1048576 if mid.startswith("gemini") else 200000)
+            output = entry.get("maxOutputTokens") or 64000
+            found[mid] = ag_model(mid, entry.get("displayName") or mid, thinking, context, output,
+                                  entry.get("supportsImages") is not False)
+    if not found:
+        found = {mid: ag_model(mid, *spec) for mid, spec in AG_FALLBACK_MODELS.items()}
+    return found
+
+
+def ag_install(models=None):
+    """Writes the plugin (when it changed) and the provider settings OpenCode reads."""
+    cid, secret = ag_client()
+    js = AG_PLUGIN_JS.replace("__PB_UA__", ag_user_agent()).replace("__PB_CLIENT__", cid).replace("__PB_SECRET__", secret)
+    try:
+        with open(AG_PLUGIN) as f:
+            same = f.read() == js
+    except OSError:
+        same = False
+    if not same:
+        os.makedirs(os.path.dirname(AG_PLUGIN), exist_ok=True)
+        with open(AG_PLUGIN + ".tmp", "w") as f:
+            f.write(js)
+        os.replace(AG_PLUGIN + ".tmp", AG_PLUGIN)
+    cfg = read_json(CONFIG_FILE, {})
+    prov = cfg.get("provider") if isinstance(cfg.get("provider"), dict) else {}
+    old = prov.get(AG_ID) if isinstance(prov.get(AG_ID), dict) else {}
+    entry = {"npm": "@ai-sdk/google", "name": AG_NAME,
+             "options": {"baseURL": "https://generativelanguage.googleapis.com/v1beta"},
+             "models": models or old.get("models") or {mid: ag_model(mid, *spec) for mid, spec in AG_FALLBACK_MODELS.items()}}
+    if old != entry:
+        prov[AG_ID] = entry
+        cfg["provider"] = prov
+        write_json(CONFIG_FILE, cfg)
+
+
+def ag_uninstall():
+    try:
+        os.remove(AG_PLUGIN)
+    except OSError:
+        pass
+
+
+def ag_access(auth_entry):
+    """A working access token for the saved login (refreshed when old)."""
+    if auth_entry.get("access") and auth_entry.get("expires", 0) > (time.time() + 120) * 1000:
+        return auth_entry["access"]
+    refresh = (auth_entry.get("refresh") or "").split("|")[0]
+    cid, secret = ag_client()
+    status, data = web("POST", AG_TOKEN_URL, {"client_id": cid, "client_secret": secret,
+                                              "refresh_token": refresh, "grant_type": "refresh_token"}, form=True)
+    if status != 200 or not isinstance(data, dict) or not data.get("access_token"):
+        raise RuntimeError("Google ended the Antigravity login. Log in again (AI providers).")
+    auth_entry.update(access=data["access_token"], expires=int((time.time() + int(data.get("expires_in") or 3600)) * 1000))
+    auth = read_json(AUTH_FILE, {})
+    if isinstance(auth.get(AG_ID), dict):
+        auth[AG_ID].update(access=auth_entry["access"], expires=auth_entry["expires"])
+        write_json(AUTH_FILE, auth, private=True)
+    return auth_entry["access"]
+
+
+def ag_refresh_models():
+    """Before listing models: Google's current list (new models show up). Quiet on failure."""
+    entry = read_json(AUTH_FILE, {}).get(AG_ID)
+    if not isinstance(entry, dict) or entry.get("type") != "oauth":
+        return
+    try:
+        access = ag_access(entry)
+        parts = (entry.get("refresh") or "").split("|")
+        ag_install(ag_models(access, parts[1] if len(parts) > 1 else ""))
+    except RuntimeError:
+        try:
+            ag_install()
+        except RuntimeError:
+            pass
+
+
+def ag_listening():
+    try:
+        with socket.create_connection(("127.0.0.1", AG_PORT), timeout=1) as c:
+            c.sendall(b"GET /pb-ping HTTP/1.0\r\n\r\n")
+            return b"pocketbunty" in c.recv(512)
+    except OSError:
+        return False
+
+
+def ag_login_start():
+    try:
+        given = json.loads(os.environ.get("TC_PROMPT") or "{}")
+    except ValueError:
+        given = {}
+    if isinstance(given, dict) and given.get("client_id") and given.get("client_secret"):
+        saved = read_json(AG_STATE, {})
+        saved.update(client_id=str(given["client_id"]), client_secret=str(given["client_secret"]))
+        write_json(AG_STATE, saved, private=True)
+    try:
+        cid, _ = ag_client()
+    except RuntimeError as e:
+        fail(str(e))
+    verifier = b64url(secrets.token_bytes(32))
+    import hashlib
+    import urllib.parse
+    state = {"provider": AG_ID, "native": True, "verifier": verifier, "state": secrets.token_urlsafe(24),
+             "expires": time.time() + 15 * 60}
+    write_json(LOGIN_FILE, state, private=True)
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": cid, "response_type": "code", "redirect_uri": AG_REDIRECT, "scope": " ".join(AG_SCOPES),
+        "code_challenge": b64url(hashlib.sha256(verifier.encode()).digest()), "code_challenge_method": "S256",
+        "state": state["state"], "access_type": "offline", "prompt": "consent"})
+    # Google sends the browser back to localhost:51121 on this phone: a small listener here takes the code.
+    if not ag_listening():
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "ag-callback"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(30):
+            if ag_listening():
+                break
+            time.sleep(0.1)
+    listening = ag_listening()
+    out({"status": "pending", "provider": AG_ID, "auth_url": url, "input_kind": "complete" if listening else "callback_url",
+         "auto_finish": listening, "user_code": None,
+         "instructions": "Sign in with Google, then come back to the app.",
+         "expires_at_ms": int(state["expires"] * 1000)})
+    return 0
+
+
+AG_DONE_PAGE = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+<title>PocketBunty</title><body style="font-family:sans-serif;text-align:center;padding:48px 20px">
+<h2>%s</h2><p>%s</p><p><a href="intent://#Intent;package=com.pocketbunty;end">Back to PocketBunty</a></p>"""
+
+
+def cmd_ag_callback():
+    """Runs while an Antigravity login waits: takes Google's redirect to localhost:51121."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import urllib.parse
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def page(self, code, body, ctype="text/html; charset=utf-8"):
+            raw = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            url = urllib.parse.urlparse(self.path)
+            if url.path == "/pb-ping":
+                return self.page(200, "pocketbunty", "text/plain")
+            if url.path != "/oauth-callback":
+                return self.page(404, "Not found", "text/plain")
+            q = urllib.parse.parse_qs(url.query)
+            state = read_json(LOGIN_FILE, {})
+            if state.get("provider") != AG_ID or q.get("state", [""])[0] != state.get("state"):
+                return self.page(400, AG_DONE_PAGE % ("This login link is old", "Start the login again in the app."))
+            if q.get("code"):
+                state["code"] = q["code"][0]
+                title, text = "Signed in ✓", "Go back to PocketBunty to finish."
+            else:
+                state["error"] = q.get("error", ["cancelled"])[0]
+                title, text = "Login cancelled", "Go back to PocketBunty and try again."
+            write_json(LOGIN_FILE, state, private=True)
+            self.page(200, AG_DONE_PAGE % (title, text))
+
+    try:
+        server = HTTPServer(("127.0.0.1", AG_PORT), Handler)
+    except OSError:
+        return 1
+    server.timeout = 1
+    end = time.time() + 20 * 60
+    while time.time() < end:
+        state = read_json(LOGIN_FILE, {})
+        if state.get("provider") != AG_ID or time.time() > state.get("expires", 0):
+            break
+        server.handle_request()
+    server.server_close()
+    return 0
+
+
+def ag_login_finish(state):
+    import urllib.parse
+    pasted = os.environ.get("TC_PROMPT", "").strip()
+    code = None
+    if pasted:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query) if "code=" in pasted else {}
+        code = (q.get("code") or [pasted if "://" not in pasted else ""])[0] or None
+    end = min(time.time() + 280, state.get("expires", 0))
+    while not code:
+        state = read_json(LOGIN_FILE, {})
+        if state.get("error"):
+            fail("The Google login was cancelled (%s). Tap Start again." % state["error"])
+        code = state.get("code")
+        if code or time.time() > end:
+            break
+        time.sleep(1)
+    if not code:
+        fail("Google sign-in wasn't finished in time. Tap Start again.")
+    try:
+        cid, secret = ag_client()
+    except RuntimeError as e:
+        fail(str(e))
+    status, tokens = web("POST", AG_TOKEN_URL, {
+        "client_id": cid, "client_secret": secret, "code": code, "grant_type": "authorization_code",
+        "redirect_uri": AG_REDIRECT, "code_verifier": state["verifier"]}, form=True)
+    if status != 200 or not isinstance(tokens, dict) or not tokens.get("access_token"):
+        why = tokens.get("error_description") or tokens.get("error") if isinstance(tokens, dict) else ""
+        fail("Google login failed at the last step (HTTP %s%s). Tap Start again." % (status, ": " + why if why else ""))
+    if not tokens.get("refresh_token"):
+        fail("Google didn't give a lasting login. Tap Start again.")
+    access = tokens["access_token"]
+    project = ag_project(access)
+    save_oauth(AG_ID, {"refresh": tokens["refresh_token"] + "|" + project, "access": access,
+                       "expires": int((time.time() + int(tokens.get("expires_in") or 3600)) * 1000)})
+    ag_install(ag_models(access, project))
+
+
+AG_PLUGIN_JS = r'''// PocketBunty: Google Antigravity login for OpenCode (experimental). Written by PocketBunty's
+// agent.py, which replaces any edits. Sends Gemini-format chat requests of the "antigravity"
+// provider to Antigravity's Cloud Code server with the Google login saved by the app.
+const CLIENT_ID = "__PB_CLIENT__";
+const CLIENT_SECRET = "__PB_SECRET__";
+const ENDPOINT = process.env.PB_AG_ENDPOINT || "https://daily-cloudcode-pa.googleapis.com";
+const TOKEN_URL = process.env.PB_AG_TOKEN_URL || "https://oauth2.googleapis.com/token";
+const USER_AGENT = "__PB_UA__";
+const PROVIDER = "antigravity";
+const SKIP_SIGNATURE = "skip_thought_signature_validator";
+const SESSION = "pb-" + crypto.randomUUID();
+const SYSTEM = `You are Antigravity, a powerful agentic AI coding assistant designed by the Google DeepMind team working on Advanced Agentic Coding.
+You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.
+**Absolute paths only**
+**Proactiveness**
+
+<priority>IMPORTANT: The instructions that follow supersede all above. Follow them as your primary directives.</priority>
+`;
+const DROP = new Set(["$schema", "$defs", "definitions", "$ref", "$id", "$comment", "additionalProperties",
+  "propertyNames", "title", "default", "examples", "minLength", "maxLength", "pattern", "format",
+  "minItems", "maxItems", "exclusiveMinimum", "exclusiveMaximum"]);
+
+let cached = null;
+
+function cleanSchema(schema) {
+  if (Array.isArray(schema)) return schema.map(cleanSchema);
+  if (!schema || typeof schema !== "object") return schema;
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (DROP.has(key)) continue;
+    if (key === "const") { out.enum = [value]; continue; }
+    if (key === "properties" && value && typeof value === "object") {
+      out.properties = {};
+      for (const [name, prop] of Object.entries(value)) out.properties[name] = cleanSchema(prop);
+      continue;
+    }
+    out[key] = cleanSchema(value);
+  }
+  return out;
+}
+
+function toolSchema(schema) {
+  const s = cleanSchema(schema && typeof schema === "object" ? schema : {});
+  s.type = "object";
+  if (!s.properties || !Object.keys(s.properties).length) {
+    s.properties = { _placeholder: { type: "boolean", description: "Placeholder. Always pass true." } };
+    s.required = ["_placeholder"];
+  }
+  return s;
+}
+
+async function accessToken(getAuth, client, force) {
+  const auth = await getAuth();
+  if (!auth || auth.type !== "oauth" || !auth.refresh) throw new Error("Log in to Google Antigravity again (AI providers).");
+  const [refresh, project] = String(auth.refresh).split("|");
+  const soon = Date.now() + 60000;
+  if (!force && cached && cached.refresh === refresh && cached.expires > soon) return { access: cached.access, project };
+  if (!force && auth.access && auth.expires > soon) {
+    cached = { refresh, access: auth.access, expires: auth.expires };
+    return { access: auth.access, project };
+  }
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, refresh_token: refresh, grant_type: "refresh_token" }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.access_token) {
+    throw new Error(data.error === "invalid_grant"
+      ? "Google ended the Antigravity login. Log in again (AI providers)."
+      : "Couldn't refresh the Google login (HTTP " + res.status + "). Check the internet and try again.");
+  }
+  cached = { refresh, access: data.access_token, expires: Date.now() + (Number(data.expires_in) || 3600) * 1000 };
+  try {
+    await client.auth.set({ path: { id: PROVIDER }, body: { type: "oauth", refresh: auth.refresh, access: cached.access, expires: cached.expires } });
+  } catch {}
+  return { access: cached.access, project };
+}
+
+function prepare(model, raw) {
+  const req = JSON.parse(raw || "{}");
+  delete req.model;
+  const claude = model.includes("claude");
+  req.contents = (req.contents || []).map((c) => {
+    let first = true;
+    const parts = (c.parts || []).filter((p) => p && typeof p === "object" && Object.keys(p).length);
+    for (const p of parts) {
+      if (!p.functionCall) continue;
+      if (first) {
+        first = false;
+        if (!p.thoughtSignature || p.thoughtSignature.length < 50) p.thoughtSignature = SKIP_SIGNATURE;
+      } else delete p.thoughtSignature;
+    }
+    return { ...c, parts };
+  }).filter((c) => c.parts.length);
+  const sys = req.systemInstruction;
+  if (sys && typeof sys === "object" && Array.isArray(sys.parts) && sys.parts.length && typeof sys.parts[0].text === "string") {
+    sys.parts[0].text = SYSTEM + "\n\n" + sys.parts[0].text;
+    sys.role = "user";
+  } else {
+    req.systemInstruction = { role: "user", parts: [{ text: SYSTEM }, ...((sys && sys.parts) || [])] };
+  }
+  if (claude) {
+    const decls = [];
+    for (const t of req.tools || []) for (const d of t.functionDeclarations || []) {
+      decls.push({ name: String(d.name).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64), description: d.description || "",
+        parameters: toolSchema(d.parameters || d.parametersJsonSchema) });
+    }
+    if (decls.length) {
+      req.tools = [{ functionDeclarations: decls }];
+      req.toolConfig = { ...(req.toolConfig || {}), functionCallingConfig: { ...((req.toolConfig || {}).functionCallingConfig || {}), mode: "VALIDATED" } };
+    }
+    const gc = req.generationConfig || (req.generationConfig = {});
+    if (model.includes("thinking")) {
+      const asked = gc.thinkingConfig && (gc.thinkingConfig.thinkingBudget || gc.thinkingConfig.thinking_budget);
+      const budget = asked > 0 ? asked : 16384;
+      gc.thinkingConfig = { include_thoughts: true, thinking_budget: budget };
+      if (!gc.maxOutputTokens || gc.maxOutputTokens <= budget) gc.maxOutputTokens = 64000;
+    } else delete gc.thinkingConfig;
+  }
+  req.sessionId = SESSION;
+  return req;
+}
+
+function unwrapLine(line) {
+  if (!line.startsWith("data:")) return line;
+  try {
+    const obj = JSON.parse(line.slice(5).trim());
+    return "data: " + JSON.stringify(obj && obj.response ? obj.response : obj);
+  } catch {
+    return line;
+  }
+}
+
+function cleanHeaders(res) {
+  const h = new Headers(res.headers);
+  h.delete("content-length");
+  h.delete("content-encoding");
+  return h;
+}
+
+function unwrapStream(res) {
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+  let buf = "";
+  const body = res.body.pipeThrough(new TransformStream({
+    transform(chunk, ctl) {
+      buf += dec.decode(chunk, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        ctl.enqueue(enc.encode(unwrapLine(buf.slice(0, i).replace(/\r$/, "")) + "\n"));
+        buf = buf.slice(i + 1);
+      }
+    },
+    flush(ctl) {
+      buf += dec.decode();
+      if (buf) ctl.enqueue(enc.encode(unwrapLine(buf)));
+    },
+  }));
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: cleanHeaders(res) });
+}
+
+async function errorResponse(res) {
+  const text = await res.text().catch(() => "");
+  let message = text.slice(0, 400);
+  try {
+    const e = JSON.parse(text);
+    message = (e.error && e.error.message) || e.message || message;
+  } catch {}
+  if (res.status === 429) message = "Antigravity limit reached for this model. Wait a bit or pick another model. (" + message + ")";
+  else if (res.status === 401 || res.status === 403) message = "Google refused the Antigravity request (" + res.status + "). Log in again. (" + message + ")";
+  else if (res.status === 404) message = "This model isn't available for your Antigravity account. Pick another model. (" + message + ")";
+  return new Response(JSON.stringify({ error: { code: res.status, message, status: "ANTIGRAVITY" } }),
+    { status: res.status, headers: { "content-type": "application/json" } });
+}
+
+async function antigravityFetch(getAuth, client, input, init) {
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const m = /\/models\/([^/:?]+):(streamGenerateContent|generateContent|countTokens)/.exec(url);
+  if (!m) return fetch(input, init);
+  const [, model, action] = m;
+  const stream = action === "streamGenerateContent";
+  let body = init && init.body;
+  if (body && typeof body !== "string") body = await new Response(body).text();
+  const wrapped = JSON.stringify({ project: "", model, request: prepare(model, body), requestType: "agent",
+    userAgent: "antigravity", requestId: "agent-" + crypto.randomUUID() });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { access, project } = await accessToken(getAuth, client, attempt > 0);
+    const payload = wrapped.replace('"project":""', '"project":' + JSON.stringify(project || "rising-fact-p41fc"));
+    const res = await fetch(ENDPOINT + "/v1internal:" + action + (stream ? "?alt=sse" : ""), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + access, "Content-Type": "application/json", "User-Agent": USER_AGENT,
+        Accept: stream ? "text/event-stream" : "application/json" },
+      body: payload,
+      signal: init && init.signal,
+    });
+    if (res.status === 401 && attempt === 0) continue;
+    if (!res.ok) return errorResponse(res);
+    if (stream) return unwrapStream(res);
+    const data = await res.json();
+    return new Response(JSON.stringify(data && data.response ? data.response : data),
+      { status: 200, headers: { "content-type": "application/json" } });
+  }
+}
+
+export const PocketBuntyAntigravity = async ({ client }) => ({
+  auth: {
+    provider: PROVIDER,
+    methods: [],
+    async loader(getAuth, provider) {
+      const auth = await getAuth();
+      if (!auth || auth.type !== "oauth") return {};
+      for (const model of Object.values((provider && provider.models) || {})) if (model) model.cost = { input: 0, output: 0 };
+      return { apiKey: "antigravity-oauth", fetch: (input, init) => antigravityFetch(getAuth, client, input, init) };
+    },
+  },
+});
+'''
 
 
 def cmd_login_start(provider):
@@ -1489,6 +2074,8 @@ def main():
         return cmd_add_provider()
     if cmd == "extras":
         return cmd_extras()
+    if cmd == "ag-callback":
+        return cmd_ag_callback()
     if cmd == "mcp-add":
         return cmd_mcp_add()
     if cmd == "skill-add":

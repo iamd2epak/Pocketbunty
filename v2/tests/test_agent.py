@@ -94,6 +94,66 @@ class FakeProvider(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
 
 
+class FakeAntigravity(BaseHTTPRequestHandler):
+    """Google's token endpoint and Antigravity's Cloud Code server. Records what it was sent."""
+    seen = []
+
+    def log_message(self, *args):
+        pass
+
+    def reply(self, obj, status=200, ctype="application/json"):
+        raw = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("content-type", ctype)
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        self.reply(b"version: 2.30.1\nfiles: []\n", ctype="text/yaml")
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("content-length") or 0)).decode()
+        FakeAntigravity.seen.append((self.path, dict(self.headers), raw))
+        if self.path == "/token":
+            import urllib.parse
+            form = {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+            if form.get("grant_type") == "authorization_code" and form.get("code") == "good-code":
+                return self.reply({"access_token": "ya29.access", "refresh_token": "1//refresh", "expires_in": 3599})
+            if form.get("grant_type") == "refresh_token" and form.get("refresh_token") == "1//refresh":
+                return self.reply({"access_token": "ya29.access", "expires_in": 3599})
+            return self.reply({"error": "invalid_grant"}, 400)
+        if self.headers.get("authorization") != "Bearer ya29.access":
+            return self.reply({"error": {"message": "bad token"}}, 401)
+        if self.path == "/v1internal:loadCodeAssist":
+            return self.reply({"cloudaicompanionProject": "proj-123", "currentTier": {"id": "free-tier"}})
+        if self.path == "/v1internal:fetchAvailableModels":
+            return self.reply({"models": {"gemini-3-flash": {"displayName": "Gemini 3 Flash", "maxTokens": 1048576},
+                                          "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6", "supportsThinking": False},
+                                          "chat_20706": {}, "old-model": {"disabled": True}},
+                               "agentModelSorts": [{"groups": [{"modelIds": ["gemini-3-flash", "claude-sonnet-4-6", "old-model"]}]}]})
+        if self.path == "/v1internal:streamGenerateContent?alt=sse":
+            body = json.loads(raw)
+            contents = body["request"]["contents"]
+            asked = json.dumps(contents[-1])
+            answered = any("functionResponse" in p for c in contents for p in c["parts"])
+            if "make ag.txt" in asked and body["request"].get("tools") and not answered:
+                call = {"functionCall": {"name": "write", "args": {"filePath": "ag.txt", "content": "hi\n"}}}
+                first = {"candidates": [{"content": {"role": "model", "parts": [call]}}]}
+            else:
+                first = {"candidates": [{"content": {"role": "model", "parts": [{"text": "AG says hi from " + body["model"]}]}}]}
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            for chunk in (first,
+                          {"candidates": [{"content": {"role": "model", "parts": [{"text": "."}]}, "finishReason": "STOP"}],
+                           "usageMetadata": {"promptTokenCount": 50, "candidatesTokenCount": 5, "totalTokenCount": 55}}):
+                self.wfile.write(b"data: " + json.dumps({"response": chunk, "traceId": "t"}).encode() + b"\r\n\r\n")
+                self.wfile.flush()
+            return
+        self.reply({"error": {"message": "unknown " + self.path}}, 404)
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -116,7 +176,12 @@ class AgentTest(unittest.TestCase):
         os.makedirs(cls.home)
         os.makedirs(cls.project)
         cls.env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "GH_", "XDG_", "OPENCODE"))}
-        cls.env.update(HOME=cls.home, PB_OPENCODE=OPENCODE, PREFIX=os.path.join(cls.tmp, "prefix"))
+        cls.ag_port = free_port()
+        cls.ag = ThreadingHTTPServer(("127.0.0.1", cls.ag_port), FakeAntigravity)
+        threading.Thread(target=cls.ag.serve_forever, daemon=True).start()
+        ag = "http://127.0.0.1:%d" % cls.ag_port
+        cls.env.update(HOME=cls.home, PB_OPENCODE=OPENCODE, PREFIX=os.path.join(cls.tmp, "prefix"),
+                       PB_AG_ENDPOINT=ag, PB_AG_TOKEN_URL=ag + "/token", PB_AG_MANIFEST=ag + "/manifest.yml")
         os.makedirs(os.path.join(cls.tmp, "prefix", "glibc"))
         spec = json.dumps({"id": "fake", "name": "Fake", "baseURL": "http://127.0.0.1:%d/v1" % cls.port,
                            "key": "sk-test-1234567890", "models": ["m1"]})
@@ -125,6 +190,7 @@ class AgentTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.provider.shutdown()
+        cls.ag.shutdown()
 
     def agent(self, *args, prompt="", extra=None, check=False, timeout=180):
         env = dict(self.env, TC_PROMPT=prompt, **(extra or {}))
@@ -298,6 +364,59 @@ class AgentTest(unittest.TestCase):
         ex = json.loads(self.agent("extras", check=True).stdout)
         self.assertEqual((ex["mcp"], ex["skills"]), ([], []))
         self.assertNotEqual(self.agent("skill-remove", "../x").returncode, 0)
+
+    def test_antigravity_login_and_chat(self):
+        import urllib.parse
+        import urllib.request
+        st = {p["id"]: p for p in json.loads(self.agent("status", check=True).stdout)["providers"]}
+        self.assertEqual((st["antigravity"]["auth_kind"], st["antigravity"]["status"]), ("OAuth", "not configured"))
+        self.assertNotEqual(self.agent("login-start", "antigravity").returncode, 0, "no OAuth client from the app")
+        client = json.dumps({"client_id": "123-test.apps.googleusercontent.com", "client_secret": "test-secret"})
+        start = json.loads(self.agent("login-start", "antigravity", prompt=client, check=True).stdout)
+        self.assertIn("client_id=123-test.apps", start["auth_url"])
+        self.assertEqual(start["input_kind"], "complete")
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(start["auth_url"]).query)
+        self.assertEqual(q["redirect_uri"], ["http://localhost:51121/oauth-callback"])
+        # A wrong state is refused; the right one is taken (what the browser does after Google's page).
+        bad = "http://127.0.0.1:51121/oauth-callback?code=x&state=wrong"
+        with self.assertRaises(urllib.error.HTTPError):
+            urllib.request.urlopen(bad, timeout=5)
+        page = urllib.request.urlopen("http://127.0.0.1:51121/oauth-callback?code=good-code&state=" + q["state"][0], timeout=5)
+        self.assertIn("Signed in", page.read().decode())
+        done = self.agent("login-finish", "antigravity", check=True)
+        self.assertIn('"done"', done.stdout)
+        with open(os.path.join(self.home, ".local", "share", "opencode", "auth.json")) as f:
+            auth = json.load(f)
+        self.assertEqual(auth["antigravity"]["refresh"], "1//refresh|proj-123")
+        self.assertTrue(os.path.exists(os.path.join(self.home, ".config", "opencode", "plugin", "pocketbunty-antigravity.js")))
+        models = json.loads(self.agent("models", "antigravity", check=True).stdout)["models"]
+        self.assertEqual(sorted(models), ["claude-sonnet-4-6", "gemini-3-flash"])
+        FakeAntigravity.seen.clear()
+        for model in ("gemini-3-flash", "claude-sonnet-4-6"):
+            r, events = self.run_chat("say hi", model="antigravity/" + model)
+            text = "".join(e.get("text", "") for e in events if e.get("type") == "text")
+            self.assertIn("AG says hi from " + model, text, r.stdout + r.stderr)
+        sent = [(h, json.loads(b)) for p, h, b in FakeAntigravity.seen if p.startswith("/v1internal:stream")]
+        self.assertTrue(sent)
+        for headers, body in sent:
+            self.assertEqual(body["project"], "proj-123")
+            self.assertTrue(headers["User-Agent"].startswith("antigravity/hub/2.30.1 "))
+            self.assertTrue(body["request"]["systemInstruction"]["parts"][0]["text"].startswith("You are Antigravity"))
+        # An old access token is refreshed with the saved login.
+        auth["antigravity"].update(access="ya29.old", expires=0)
+        with open(os.path.join(self.home, ".local", "share", "opencode", "auth.json"), "w") as f:
+            json.dump(auth, f)
+        r, events = self.run_chat("make ag.txt", model="antigravity/claude-sonnet-4-6")
+        self.assertTrue(os.path.exists(os.path.join(self.project, "ag.txt")), r.stdout + r.stderr)
+        replay = [json.loads(b) for p, h, b in FakeAntigravity.seen if p.startswith("/v1internal:stream") and "functionResponse" in b]
+        calls = [p for c in replay[0]["request"]["contents"] for p in c["parts"] if "functionCall" in p]
+        self.assertEqual(calls[0]["thoughtSignature"], "skip_thought_signature_validator")
+        claude = [b for h, b in sent if b["model"] == "claude-sonnet-4-6" and b["request"].get("tools")]
+        self.assertTrue(claude)
+        self.assertEqual(claude[0]["request"]["toolConfig"]["functionCallingConfig"]["mode"], "VALIDATED")
+        self.assertEqual(json.loads(self.agent("logout", "antigravity", check=True).stdout)["removed"], ["login", "custom provider"])
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "opencode", "plugin", "pocketbunty-antigravity.js")))
+        self.no_servers_left()
 
     def test_dns_fix_writes_glibc_files_once(self):
         self.agent("dns", check=True)
