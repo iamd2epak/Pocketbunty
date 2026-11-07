@@ -947,8 +947,31 @@ def cmd_skill_show(sid):
     return 0
 
 
+MCP_AUTH_FILE = os.path.join(DATA, "mcp-auth.json")
+FIREBASE_LOGIN = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "configstore", "firebase-tools.json")
+
+
+def mcp_signed_in(name, entry, auth):
+    """True/False for servers that sign in (OAuth, Firebase), None for the others."""
+    command = entry.get("command") or []
+    if entry.get("type") == "local" and any("firebase-tools" in str(c) for c in command):
+        tokens = read_json(FIREBASE_LOGIN, {}).get("tokens")
+        return bool(isinstance(tokens, dict) and (tokens.get("refresh_token") or tokens.get("access_token")))
+    if entry.get("type") != "remote" or string_map(entry.get("headers")) or entry.get("oauth") is False:
+        return None
+    saved = auth.get(name) if isinstance(auth.get(name), dict) else {}
+    tokens = saved.get("tokens") if isinstance(saved.get("tokens"), dict) else {}
+    if saved.get("serverUrl") and saved.get("serverUrl") != entry.get("url"):
+        return False
+    if not tokens.get("accessToken"):
+        return False
+    expires = tokens.get("expiresAt")
+    return bool(tokens.get("refreshToken")) or not expires or expires > time.time()
+
+
 def cmd_extras():
     cfg = read_json(CONFIG_FILE, {})
+    auth = read_json(MCP_AUTH_FILE, {})
     servers = []
     for name, entry in sorted(mcp_servers(cfg).items(), key=lambda kv: kv[0].lower()):
         if not isinstance(entry, dict):
@@ -958,7 +981,8 @@ def cmd_extras():
         headers = string_map(entry.get("headers"))
         servers.append({"name": name, "type": kind, "target": str(target or ""), "enabled": entry.get("enabled", True) is not False,
                         "headers": sorted(headers), "env": sorted(string_map(entry.get("environment"))),
-                        "oauth": kind == "remote" and not headers and entry.get("oauth") is not False})
+                        "oauth": kind == "remote" and not headers and entry.get("oauth") is not False,
+                        "signed_in": mcp_signed_in(name, entry, auth)})
     skills, seen = [], set()
     for source, root in SKILL_SOURCES:
         for sid, path in skill_files(root):
@@ -1027,6 +1051,11 @@ def cmd_mcp_set(name, action):
         fail("No MCP server called %s." % name)
     if action == "remove":
         del servers[name]
+        # Its OAuth login goes too (a later server with the same name signs in again).
+        auth = read_json(MCP_AUTH_FILE, {})
+        if name in auth:
+            del auth[name]
+            write_json(MCP_AUTH_FILE, auth, private=True)
     else:
         servers[name]["enabled"] = action == "enable"
     cfg["mcp"] = servers

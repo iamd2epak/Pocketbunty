@@ -261,6 +261,25 @@ class AgentTest(unittest.TestCase):
         self.assertFalse(os.path.exists(other))
         self.assertNotEqual(self.agent("skill-show", "../etc").returncode, 0)
         self.assertTrue(mcp["docs"]["oauth"] is False and mcp["tools"]["oauth"] is False)
+        self.assertIsNone(mcp["docs"]["signed_in"])
+        self.agent("mcp-add", prompt=json.dumps({"name": "designs", "type": "remote", "url": "https://mcp.example.com/mcp"}), check=True)
+        signed = lambda: {m["name"]: m for m in json.loads(self.agent("extras", check=True).stdout)["mcp"]}["designs"]
+        self.assertEqual((signed()["oauth"], signed()["signed_in"]), (True, False))
+        auth_file = os.path.join(self.home, ".local", "share", "opencode", "mcp-auth.json")
+        with open(auth_file, "w") as f:
+            json.dump({"designs": {"serverUrl": "https://mcp.example.com/mcp", "tokens": {"accessToken": "a", "refreshToken": "r"}}}, f)
+        self.assertTrue(signed()["signed_in"])
+        self.agent("mcp-add", prompt=json.dumps({"name": "fb", "type": "local", "command": "npx -y firebase-tools@latest mcp"}), check=True)
+        fb = lambda: {m["name"]: m for m in json.loads(self.agent("extras", check=True).stdout)["mcp"]}["fb"]["signed_in"]
+        self.assertFalse(fb())
+        os.makedirs(os.path.join(self.home, ".config", "configstore"), exist_ok=True)
+        with open(os.path.join(self.home, ".config", "configstore", "firebase-tools.json"), "w") as f:
+            json.dump({"tokens": {"refresh_token": "x"}}, f)
+        self.assertTrue(fb())
+        self.agent("mcp-remove", "designs", check=True)
+        self.agent("mcp-remove", "fb", check=True)
+        with open(auth_file) as f:
+            self.assertNotIn("designs", json.load(f))
         cfg_file = os.path.join(self.home, ".config", "opencode", "opencode.json")
         self.assertEqual(os.stat(cfg_file).st_mode & 0o777, 0o600)
         # OpenCode accepts the config (a broken MCP server doesn't stop the chat) and sees the skills.
